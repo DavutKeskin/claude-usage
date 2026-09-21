@@ -218,14 +218,6 @@ def fetch_limits(cfg, live=True):
     fh, sd = j.get("five_hour") or {}, j.get("seven_day") or {}
     out["five"], out["five_reset"] = fh.get("utilization"), fh.get("resets_at")
     out["week"], out["week_reset"] = sd.get("utilization"), sd.get("resets_at")
-    # Önbellek eskiyse pencere çoktan sıfırlanmış olabilir: yanıltıcı yüzdeyi gösterme.
-    now = datetime.now(timezone.utc)
-    if out["five_reset"] and parse_ts(out["five_reset"]) < now:
-        out["five"], out["five_reset"] = None, None
-        out["source"] += "; 5s penceresi sıfırlanmış"
-    if out["week_reset"] and parse_ts(out["week_reset"]) < now:
-        out["week"], out["fable"] = None, None
-        out["source"] += "; haftalık pencere sıfırlanmış"
     b = j.get("seven_day_breakdown") or {}
     out["week_start"] = b.get("window_started_at")
     if not out["week_start"] and out["week_reset"]:
@@ -235,6 +227,15 @@ def fetch_limits(cfg, live=True):
             name = ((l.get("scope") or {}).get("model") or {}).get("display_name", "")
             if "Fable" in str(name):
                 out["fable"], out["fable_reset"] = l.get("percent"), l.get("resets_at")
+    # Önbellek eskiyse pencere çoktan sıfırlanmış olabilir: yanıltıcı değerleri gösterme
+    # ve o eski pencere üzerinden maliyet toplama.
+    now = datetime.now(timezone.utc)
+    if out["five_reset"] and parse_ts(out["five_reset"]) < now:
+        out["five"] = out["five_reset"] = None
+        out["source"] += "; 5s penceresi sıfırlanmış"
+    if out["week_reset"] and parse_ts(out["week_reset"]) < now:
+        out["week"] = out["fable"] = out["week_reset"] = out["week_start"] = out["fable_reset"] = None
+        out["source"] += "; haftalık pencere sıfırlanmış"
     return out
 
 
@@ -535,6 +536,7 @@ def report(a):
     for _, label, _ in ACCOUNTS:
         L = limits[label]
         if not L["five_reset"]:
+            print(f"**{label}** — güncel pencere verisi yok (Claude Code'u bir kez açıp tekrar deneyin)\n")
             continue
         start = (parse_ts(L["five_reset"]) - timedelta(hours=5)).astimezone().strftime("%H:%M")
         rows = sorted(((p, c) for (aa, p), c in sproj.items() if aa == label), key=lambda x: -x[1])
