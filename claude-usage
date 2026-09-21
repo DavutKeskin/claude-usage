@@ -1,0 +1,558 @@
+#!/usr/bin/env python3
+"""Claude Code token kullanımı ve limit raporu (hesap → gün → proje → oturum).
+
+Kullanım:
+  claude-usage                 # dün + bugün
+  claude-usage -d 7            # son 7 gün
+  claude-usage -o ~/claude-usage   # raporu dosyaya yaz (YYYY-MM-DD.md + latest.md)
+  claude-usage --no-live       # API'ye gitme, sadece yerel önbellek
+  claude-usage --no-titles     # oturum adlarını gizle (raporu paylaşırken)
+  claude-usage --json          # ham veri
+
+Yapılandırma gerekmez: $CLAUDE_CONFIG_DIR, ~/.claude ve ~/.claude-* dizinleri otomatik
+bulunur; hesap etiketi e-postadan, plan çarpanı (Max 5x/20x) credentials'tan okunur.
+İsteğe bağlı geçersiz kılma: ~/.config/claude-usage/config.json  (bkz. README)
+
+Veri kaynakları (hepsi yerel; yalnızca limit yüzdeleri için api.anthropic.com'a gidilir):
+  - <config>/projects/**/*.jsonl   transcript'ler (token sayıları)
+  - <config>/history.jsonl         oturum → hesap eşlemesi (istem zamanına göre)
+  - <config>/.credentials.json     OAuth token → /api/oauth/usage (canlı limit yüzdeleri)
+  - <config>/.claude.json          cachedUsageUtilization (token süresi dolmuşsa yedek)
+"""
+import argparse, bisect, glob, json, os, re, subprocess, sys, time, urllib.request, urllib.error
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+
+HOME = os.path.expanduser("~")
+
+# ── Ayarlar ────────────────────────────────────────────────────────────────
+CONFIG_FILE = os.path.join(HOME, ".config", "claude-usage", "config.json")
+ACCOUNTS = []      # [(config dizini, etiket, plan çarpanı)] — etiket başına tek satır
+HISTORY_DIRS = []  # [(config dizini, etiket)] — aynı hesaba ait tüm dizinler
+CAPACITY_1X = {}   # {"week": $, "fable": $, "five": $} — 1x plan kapasitesi (isteğe bağlı)
+
+# $/M token: (input, output, cache yazma, cache okuma)
+PRICE = {
+    "claude-fable-5-1": (10, 50, 12.5, 0.25),
+    "claude-fable-5":   (10, 50, 12.5, 0.25),
+    "claude-opus-5":    (5, 25, 6.25, 0.5),
+    "claude-opus-4-8":  (5, 25, 6.25, 0.5),
+    "claude-opus-4-7":  (5, 25, 6.25, 0.5),
+    "claude-sonnet-5":  (2, 10, 2.5, 0.2),
+    "claude-sonnet-4-6": (3, 15, 3.75, 0.3),
+    "claude-haiku-4-5": (1, 5, 1.25, 0.1),
+}
+DEFAULT_PRICE = (5, 25, 6.25, 0.5)
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def _read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def claude_json(d):
+    """<dir>/.claude.json; varsayılan ~/.claude için dosya ~/.claude.json da olabilir."""
+    cands = [os.path.join(d, ".claude.json")]
+    if os.path.realpath(d) == os.path.realpath(os.path.join(HOME, ".claude")):
+        cands.append(os.path.join(HOME, ".claude.json"))
+    first = {}
+    for p in cands:
+        j = _read_json(p)
+        if j.get("oauthAccount"):
+            return j
+        first = first or j
+    return first
+
+
+def load_credentials(d):
+    """claudeAiOauth sözlüğü; Linux'ta dosya, macOS'ta anahtar zinciri (en iyi çaba)."""
+    j = _read_json(os.path.join(d, ".credentials.json"))
+    if not j and sys.platform == "darwin":
+        try:
+            out = subprocess.run(["security", "find-generic-password", "-s",
+                                  "Claude Code-credentials", "-w"],
+                                 capture_output=True, text=True, timeout=10).stdout
+            j = json.loads(out)
+        except Exception:
+            j = {}
+    return j.get("claudeAiOauth") or {}
+
+
+def discover_accounts():
+    """ACCOUNTS / HISTORY_DIRS / CAPACITY_1X / PRICE değerlerini doldurur."""
+    cfg = _read_json(CONFIG_FILE)
+    for k, v in (cfg.get("prices") or {}).items():
+        PRICE[k] = tuple(v)
+    cap = cfg.get("capacity_1x") or {}
+    if cfg.get("capacity_1x_week"):
+        cap.setdefault("week", cfg["capacity_1x_week"])
+    CAPACITY_1X.update({k: float(v) for k, v in cap.items() if v})
+
+    found = []   # (dir, label, mult)
+    if cfg.get("accounts"):
+        for a in cfg["accounts"]:
+            d = os.path.expanduser(a["dir"])
+            found.append((d, a.get("label") or os.path.basename(d), a.get("multiplier")))
+    else:
+        cands = [os.environ.get("CLAUDE_CONFIG_DIR"), os.path.join(HOME, ".claude")]
+        cands += sorted(glob.glob(os.path.join(HOME, ".claude-*")))
+        seen = set()
+        for d in cands:
+            if not d or not os.path.isdir(d) or os.path.realpath(d) in seen:
+                continue
+            if not (os.path.exists(os.path.join(d, "history.jsonl"))
+                    or os.path.exists(os.path.join(d, ".credentials.json"))):
+                continue
+            seen.add(os.path.realpath(d))
+            email = (claude_json(d).get("oauthAccount") or {}).get("emailAddress")
+            found.append((d, email or os.path.basename(d), None))
+    labels = set()
+    for d, label, mult in found:
+        HISTORY_DIRS.append((d, label))
+        if label in labels:
+            continue
+        labels.add(label)
+        if not mult:
+            tier = (load_credentials(d).get("rateLimitTier")
+                    or (claude_json(d).get("oauthAccount") or {}).get("organizationRateLimitTier") or "")
+            m = re.search(r"(\d+)x", tier)
+            mult = int(m.group(1)) if m else 1
+        ACCOUNTS.append((d, label, mult))
+    if not ACCOUNTS:
+        sys.exit("Claude Code yapılandırma dizini bulunamadı (~/.claude, ~/.claude-*, $CLAUDE_CONFIG_DIR).")
+
+
+def project_roots():
+    roots = []
+    for d, _ in HISTORY_DIRS:
+        r = os.path.realpath(os.path.join(d, "projects"))
+        if os.path.isdir(r) and r not in roots:
+            roots.append(r)
+    return roots
+
+
+def fmt(n):
+    return f"{int(round(n)):,}".replace(",", ".")
+
+
+def price_for(model):
+    if not model or model == "<synthetic>":
+        return None
+    for k, v in PRICE.items():
+        if model.startswith(k):
+            return v
+    return DEFAULT_PRICE
+
+
+def cost(model, u):
+    p = price_for(model)
+    if not p:
+        return 0.0
+    return (u.get("input_tokens", 0) * p[0] + u.get("output_tokens", 0) * p[1]
+            + u.get("cache_creation_input_tokens", 0) * p[2]
+            + u.get("cache_read_input_tokens", 0) * p[3]) / 1e6
+
+
+def is_fable(model):
+    return bool(model) and model.startswith("claude-fable")
+
+
+def local_day(dt):
+    return dt.astimezone().strftime("%Y-%m-%d")
+
+
+_FRAC = re.compile(r"\.(\d+)")
+
+
+def parse_ts(s):
+    s = s.replace("Z", "+00:00")
+    s = _FRAC.sub(lambda m: "." + (m.group(1) + "000000")[:6], s, count=1)
+    dt = datetime.fromisoformat(s)
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def loc(s):
+    return parse_ts(s).astimezone().strftime("%d %b %H:%M") if s else "?"
+
+
+# ── Canlı limitler ─────────────────────────────────────────────────────────
+def fetch_limits(cfg, live=True):
+    """{'five':%, 'five_reset', 'week':%, 'week_reset', 'week_start', 'fable':%, 'source'}"""
+    out = {"five": None, "five_reset": None, "week": None, "week_reset": None,
+           "week_start": None, "fable": None, "fable_reset": None, "source": None}
+    d = cfg
+    j = None
+    if live:
+        try:
+            cred = load_credentials(d)
+            if not cred.get("accessToken"):
+                out["source"] = "token yok → önbellek"
+            elif cred.get("expiresAt", 0) / 1000 > time.time():
+                req = urllib.request.Request(USAGE_URL, headers={
+                    "Authorization": "Bearer " + cred["accessToken"],
+                    "anthropic-beta": "oauth-2025-04-20",
+                    "User-Agent": "claude-code", "Accept": "application/json"})
+                j = json.load(urllib.request.urlopen(req, timeout=20))
+                out["source"] = "canlı"
+            else:
+                out["source"] = "token süresi dolmuş → önbellek"
+        except Exception as e:  # noqa
+            out["source"] = f"canlı alınamadı ({type(e).__name__}) → önbellek"
+    if j is None:
+        try:
+            c = claude_json(d).get("cachedUsageUtilization")
+            if c:
+                j = c["utilization"]
+                age = (time.time() * 1000 - c.get("fetchedAtMs", 0)) / 60000
+                out["source"] = (out["source"] or "önbellek") + f" ({age:.0f} dk önce)"
+        except Exception:
+            pass
+    if j is None:
+        out["source"] = out["source"] or "veri yok"
+        return out
+    fh, sd = j.get("five_hour") or {}, j.get("seven_day") or {}
+    out["five"], out["five_reset"] = fh.get("utilization"), fh.get("resets_at")
+    out["week"], out["week_reset"] = sd.get("utilization"), sd.get("resets_at")
+    # Önbellek eskiyse pencere çoktan sıfırlanmış olabilir: yanıltıcı yüzdeyi gösterme.
+    now = datetime.now(timezone.utc)
+    if out["five_reset"] and parse_ts(out["five_reset"]) < now:
+        out["five"], out["five_reset"] = None, None
+        out["source"] += "; 5s penceresi sıfırlanmış"
+    if out["week_reset"] and parse_ts(out["week_reset"]) < now:
+        out["week"], out["fable"] = None, None
+        out["source"] += "; haftalık pencere sıfırlanmış"
+    b = j.get("seven_day_breakdown") or {}
+    out["week_start"] = b.get("window_started_at")
+    if not out["week_start"] and out["week_reset"]:
+        out["week_start"] = (parse_ts(out["week_reset"]) - timedelta(days=7)).isoformat()
+    for l in j.get("limits") or []:
+        if l.get("kind") == "weekly_scoped":
+            name = ((l.get("scope") or {}).get("model") or {}).get("display_name", "")
+            if "Fable" in str(name):
+                out["fable"], out["fable_reset"] = l.get("percent"), l.get("resets_at")
+    return out
+
+
+# ── Oturum → hesap eşlemesi ────────────────────────────────────────────────
+def load_timeline():
+    """tl: sid -> [(ts_ms, hesap)];  first_prompt: sid -> ilk istem (oturum adı yedeği)"""
+    tl, first = defaultdict(list), {}
+    for cfg, label in HISTORY_DIRS:
+        p = os.path.join(cfg, "history.jsonl")
+        if not os.path.exists(p):
+            continue
+        for line in open(p, errors="ignore"):
+            try:
+                j = json.loads(line)
+            except ValueError:
+                continue
+            sid = j.get("sessionId")
+            if sid and j.get("timestamp"):
+                tl[sid].append((j["timestamp"], label))
+                d = (j.get("display") or "").strip()
+                if d and not d.startswith("/") and (sid not in first or j["timestamp"] < first[sid][0]):
+                    first[sid] = (j["timestamp"], d)
+    for s in tl:
+        tl[s].sort()
+    return tl, {s: v[1] for s, v in first.items()}
+
+
+def account_for(tl, sid, ms):
+    t = tl.get(sid)
+    if not t:
+        return None
+    i = bisect.bisect_right([x for x, _ in t], ms)
+    return t[i - 1][1] if i else t[0][1]
+
+
+# ── Transcript tarama ──────────────────────────────────────────────────────
+def scan(since_dt, tl, titles):
+    """Her mesaj için (dt, acct, proj, sid, model, usage) üretir; titles[sid] = ai-title."""
+    seen = set()
+    home_enc = HOME.replace("/", "-")
+    names = {}   # proje dizini -> görünen ad (transcript'teki ilk cwd)
+    files = [(root, f) for root in project_roots()
+             for f in glob.glob(root + "/**/*.jsonl", recursive=True)]
+    for root, f in files:
+        try:
+            if os.path.getmtime(f) < since_dt.timestamp():
+                continue
+            fh = open(f, errors="ignore")
+        except OSError:
+            continue
+        rel = os.path.relpath(f, root).split("/")
+        if len(rel) < 2:
+            continue
+        pdir = rel[0]
+        sid = rel[1].replace(".jsonl", "")
+        rest = pdir[len(home_enc):] if pdir.startswith(home_enc) else pdir
+        fallback = ("~/" + rest.lstrip("-")) if pdir.startswith(home_enc) and rest else ("~" if not rest else pdir)
+        for line in fh:
+            try:
+                j = json.loads(line)
+            except ValueError:
+                continue
+            if pdir not in names and j.get("cwd"):
+                c = j["cwd"]
+                names[pdir] = "~" + c[len(HOME):] if c == HOME or c.startswith(HOME + "/") else c
+            proj = names.get(pdir, fallback)
+            t = j.get("type")
+            if t == "ai-title" and j.get("aiTitle"):
+                titles[sid] = j["aiTitle"]
+                continue
+            if t != "assistant":
+                continue
+            m = j.get("message") or {}
+            u, ts = m.get("usage"), j.get("timestamp")
+            if not u or not ts:
+                continue
+            key = (m.get("id"), j.get("requestId"))
+            if key in seen:
+                continue
+            seen.add(key)
+            dt = parse_ts(ts)
+            yield dt, account_for(tl, sid, dt.timestamp() * 1000), proj, sid, m.get("model", ""), u
+
+
+# ── Ana ────────────────────────────────────────────────────────────────────
+def main():
+    ap = argparse.ArgumentParser(description="Claude Code kullanım raporu")
+    ap.add_argument("-d", "--days", type=int, default=2, help="kaç gün geriye (varsayılan 2 = dün+bugün)")
+    ap.add_argument("--no-live", action="store_true", help="API'ye gitme, önbellek kullan")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("-o", "--out", metavar="DIZIN",
+                    help="raporu DIZIN/YYYY-MM-DD.md dosyasına yaz (latest.md de güncellenir)")
+    ap.add_argument("-s", "--sessions", type=int, default=12, metavar="N",
+                    help="hesap/gün başına gösterilecek en pahalı N oturum (0 = kapat)")
+    ap.add_argument("--no-titles", action="store_true",
+                    help="oturum adlarını gizle (yalnızca kısa kimlik)")
+    ap.add_argument("--capacity-1x-week", type=float, metavar="USD",
+                    help="1x planın haftalık kapasitesi ($, liste fiyatıyla). Paylaşılan tek "
+                         "hesapta 'bu makinenin payı'nı doğru hesaplamak için; bkz. README")
+    a = ap.parse_args()
+    discover_accounts()
+    if a.capacity_1x_week:
+        CAPACITY_1X["week"] = a.capacity_1x_week
+    if a.out and not a.json:
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            report(a)
+        os.makedirs(a.out, exist_ok=True)
+        path = os.path.join(a.out, datetime.now().strftime("%Y-%m-%d") + ".md")
+        with open(path, "w") as f:
+            f.write(buf.getvalue())
+        latest = os.path.join(a.out, "latest.md")
+        try:
+            if os.path.islink(latest) or os.path.exists(latest):
+                os.remove(latest)
+            os.symlink(os.path.basename(path), latest)
+        except OSError:
+            pass
+        print(path)
+        return
+    report(a)
+
+
+def report(a):
+
+    today = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    days = [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(a.days - 1, -1, -1)]
+    labels = {days[-1]: "Bugün"}
+    if len(days) > 1:
+        labels[days[-2]] = "Dün"
+
+    limits = {label: fetch_limits(cfg, live=not a.no_live) for cfg, label, _ in ACCOUNTS}
+    mult = {label: m for _, label, m in ACCOUNTS}
+
+    since = today - timedelta(days=a.days - 1)
+    for L in limits.values():
+        if L["week_start"]:
+            since = min(since, parse_ts(L["week_start"]).astimezone())
+    tl, first_prompt = load_timeline()
+    titles = {}
+
+    # toplayıcılar
+    tok = defaultdict(lambda: defaultdict(int))     # (acct, day, proj) -> in/out/cc/cr/n
+    dcost = defaultdict(float)                      # (acct, day, proj)
+    dfable = defaultdict(float)                     # (acct, day, proj) fable maliyeti
+    mdl = defaultdict(int)                          # (acct, day, model) -> output
+    wcost, wfable, scost = defaultdict(float), defaultdict(float), defaultdict(float)
+    sproj = defaultdict(float)                      # (acct, proj) 5s penceresi
+    stok = defaultdict(lambda: defaultdict(int))    # (acct, day, sid) -> out/total/n
+    scst = defaultdict(float)                       # (acct, day, sid) maliyet
+    sfab = defaultdict(float)                       # (acct, day, sid) fable maliyeti
+    sess_proj = {}                                  # sid -> proj
+    for dt, acct, proj, sid, model, u in scan(since, tl, titles):
+        if not acct:
+            continue
+        c = cost(model, u)
+        L = limits[acct]
+        if L["week_start"] and dt >= parse_ts(L["week_start"]):
+            wcost[acct] += c
+            if is_fable(model):
+                wfable[acct] += c
+        if L["five_reset"] and dt >= parse_ts(L["five_reset"]) - timedelta(hours=5):
+            scost[acct] += c
+            sproj[(acct, proj)] += c
+        day = local_day(dt)
+        if day in days:
+            k = (acct, day, proj)
+            tok[k]["in"] += u.get("input_tokens", 0)
+            tok[k]["out"] += u.get("output_tokens", 0)
+            tok[k]["cc"] += u.get("cache_creation_input_tokens", 0)
+            tok[k]["cr"] += u.get("cache_read_input_tokens", 0)
+            tok[k]["n"] += 1
+            dcost[k] += c
+            if is_fable(model):
+                dfable[k] += c
+            mdl[(acct, day, model)] += u.get("output_tokens", 0)
+            ks = (acct, day, sid)
+            stok[ks]["out"] += u.get("output_tokens", 0)
+            stok[ks]["total"] += (u.get("input_tokens", 0) + u.get("output_tokens", 0)
+                                  + u.get("cache_creation_input_tokens", 0)
+                                  + u.get("cache_read_input_tokens", 0))
+            stok[ks]["n"] += 1
+            scst[ks] += c
+            if is_fable(model):
+                sfab[ks] += c
+            sess_proj[sid] = proj
+
+    def sess_name(sid):
+        if a.no_titles:
+            return "oturum"
+        name = titles.get(sid) or first_prompt.get(sid) or ""
+        name = " ".join(name.split())
+        if len(name) > 48:
+            name = name[:47] + "…"
+        return name.replace("|", "\\|") or "(adsız)"
+
+    # Kapasite kalibrasyonu: hesap başına "yerel maliyet / yüzde" → 1x kapasite.
+    # Hesap başka makinelerden de kullanılıyorsa yerel maliyet düşük kalır; bu yüzden
+    # hesaplar arasında en büyük 1x tahmini alınır (paylaşılan hesap için daha doğru).
+    def capacity(key_cost, key_pct, key_cfg):
+        best = CAPACITY_1X.get(key_cfg, 0.0)
+        for _, label, m in ACCOUNTS:
+            p = limits[label].get(key_pct)
+            c = key_cost[label]
+            if p and p > 0 and c > 0:
+                best = max(best, c / (p / 100) / m)
+        return {label: best * m for _, label, m in ACCOUNTS} if best else {}
+
+    cap_w = capacity(wcost, "week", "week")
+    cap_f = capacity(wfable, "fable", "fable")
+    cap_s = capacity(scost, "five", "five")
+
+    def share(c, cap):
+        return f"%{100 * c / cap:.1f}" if cap else "–"
+
+    if a.json:
+        print(json.dumps({"limits": limits, "tokens": {"|".join(k): v for k, v in tok.items()},
+                          "cost": {"|".join(k): v for k, v in dcost.items()},
+                          "capacity": {"week": cap_w, "fable": cap_f, "five": cap_s}},
+                         ensure_ascii=False, indent=1, default=str))
+        return
+
+    now = datetime.now().astimezone().strftime("%d %b %Y %H:%M")
+    print(f"# Claude Code kullanım raporu — {now}\n")
+    print("## Canlı limitler\n")
+    print("| Hesap | 5 saatlik | Sıfırlanma | Haftalık | Fable haftalık | Haftalık sıfırlanma | Kaynak |")
+    print("|---|---:|---|---:|---:|---|---|")
+    for _, label, _ in ACCOUNTS:
+        L = limits[label]
+        pct = lambda v: f"%{v:.0f}" if v is not None else "?"
+        print(f"| {label} | {pct(L['five'])} | {loc(L['five_reset'])} | {pct(L['week'])} | "
+              f"{pct(L['fable'])} | {loc(L['week_reset'])} | {L['source']} |")
+
+    print("\nBu makinenin haftalık pencere içindeki payı (tahmini):\n")
+    print("| Hesap | Yerel maliyet | Haftalık limit payı | Fable yerel | Fable limit payı | 5s yerel | 5s limit payı |")
+    print("|---|---:|---:|---:|---:|---:|---:|")
+    for _, label, _ in ACCOUNTS:
+        L = limits[label]
+        note = ""
+        if cap_w.get(label) and L["week"]:
+            local_pct = 100 * wcost[label] / cap_w[label]
+            if L["week"] - local_pct > 10:
+                note = f" ⚠ hesabın %{L['week'] - local_pct:.0f}'i başka makine/kişiden"
+        print(f"| {label} | ${wcost[label]:,.0f} | {share(wcost[label], cap_w.get(label))}{note} | "
+              f"${wfable[label]:,.0f} | {share(wfable[label], cap_f.get(label))} | "
+              f"${scost[label]:,.0f} | {share(scost[label], cap_s.get(label))} |")
+    if len(ACCOUNTS) == 1 and "week" not in CAPACITY_1X:
+        print("\nNot: tek hesap bulunduğu için kapasite yalnızca bu makinenin kullanımından "
+              "kalibre edildi; hesap başkalarıyla paylaşılıyorsa paylar olduğundan yüksek çıkar. "
+              "Gerçek pay için --capacity-1x-week verin (README: Kalibrasyon).")
+
+    for day in days:
+        title = labels.get(day, "")
+        print(f"\n## {title + ' ' if title else ''}({day})")
+        for _, label, _ in ACCOUNTS:
+            rows = [(k[2], v) for k, v in tok.items()
+                    if k[0] == label and k[1] == day and (v["in"] + v["out"] + v["cc"] + v["cr"])]
+            if not rows:
+                print(f"\n**{label}**: kullanım yok")
+                continue
+            tc = sum(dcost[(label, day, p)] for p, _ in rows)
+            tf = sum(dfable[(label, day, p)] for p, _ in rows)
+            print(f"\n**{label}** — tahmini ${tc:,.0f} → haftalık limitin {share(tc, cap_w.get(label))}'i, "
+                  f"Fable limitinin {share(tf, cap_f.get(label))}'i\n")
+            print("| Proje | Input | Output | Cache yazma | Cache okuma | Toplam | Maliyet | Haftalık pay | Fable pay |")
+            print("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+            tot = defaultdict(int)
+            for proj, v in sorted(rows, key=lambda r: -dcost[(label, day, r[0])]):
+                t = v["in"] + v["out"] + v["cc"] + v["cr"]
+                c, cf = dcost[(label, day, proj)], dfable[(label, day, proj)]
+                print(f"| {proj} | {fmt(v['in'])} | {fmt(v['out'])} | {fmt(v['cc'])} | {fmt(v['cr'])} | "
+                      f"{fmt(t)} | ${c:,.0f} | {share(c, cap_w.get(label))} | {share(cf, cap_f.get(label))} |")
+                for kk in v:
+                    tot[kk] += v[kk]
+            t = tot["in"] + tot["out"] + tot["cc"] + tot["cr"]
+            print(f"| **Toplam** | **{fmt(tot['in'])}** | **{fmt(tot['out'])}** | **{fmt(tot['cc'])}** | "
+                  f"**{fmt(tot['cr'])}** | **{fmt(t)}** | **${tc:,.0f}** | **{share(tc, cap_w.get(label))}** | "
+                  f"**{share(tf, cap_f.get(label))}** |")
+            ms = sorted(((m, o) for (aa, dd, m), o in mdl.items() if aa == label and dd == day and o),
+                        key=lambda x: -x[1])
+            print("Model (output): " + ", ".join(f"{m}: {fmt(o)}" for m, o in ms))
+            if a.sessions:
+                srows = sorted(((k[2], v) for k, v in stok.items()
+                                if k[0] == label and k[1] == day and v["total"]),
+                               key=lambda r: -scst[(label, day, r[0])])
+                if srows:
+                    print(f"\nOturumlar (en pahalı {min(a.sessions, len(srows))}/{len(srows)}):\n")
+                    print("| Oturum | Proje | Output | Toplam | Mesaj | Maliyet | Haftalık pay | Fable pay |")
+                    print("|---|---|---:|---:|---:|---:|---:|---:|")
+                    for sid, v in srows[:a.sessions]:
+                        c, cf = scst[(label, day, sid)], sfab[(label, day, sid)]
+                        print(f"| {sess_name(sid)} `{sid[:8]}` | {sess_proj.get(sid, '?')} | {fmt(v['out'])} | "
+                              f"{fmt(v['total'])} | {v['n']} | ${c:,.0f} | {share(c, cap_w.get(label))} | "
+                              f"{share(cf, cap_f.get(label))} |")
+
+    print("\n## Şu anki 5 saatlik pencere\n")
+    for _, label, _ in ACCOUNTS:
+        L = limits[label]
+        if not L["five_reset"]:
+            continue
+        start = (parse_ts(L["five_reset"]) - timedelta(hours=5)).astimezone().strftime("%H:%M")
+        rows = sorted(((p, c) for (aa, p), c in sproj.items() if aa == label), key=lambda x: -x[1])
+        print(f"**{label}** — %{L['five']:.0f} dolu, {start} → {loc(L['five_reset'])}, "
+              f"bu makineden ${scost[label]:,.0f} ({share(scost[label], cap_s.get(label))})\n")
+        if rows:
+            print("| Proje | Maliyet | 5s limit payı |")
+            print("|---|---:|---:|")
+            for p, c in rows:
+                print(f"| {p} | ${c:,.0f} | {share(c, cap_s.get(label))} |")
+        else:
+            print("bu pencerede yerel kullanım yok")
+        print()
+
+    print("Notlar: maliyetler API liste fiyatıyla tahmindir; limit payları kalibrasyona dayalıdır "
+          "(plan çarpanı credentials'tan okunur). Hesaplar arası --resume yapılan oturumlarda "
+          "her yanıt, önceki istemi gönderen hesaba yazılır.")
+
+
+if __name__ == "__main__":
+    main()
