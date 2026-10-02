@@ -266,7 +266,8 @@ def load_timeline():
 def account_for(tl, sid, ms):
     t = tl.get(sid)
     if not t:
-        return None
+        # history'de olmayan oturum (başka makineden taşınmış vb.): tek hesap varsa onundur
+        return ACCOUNTS[0][1] if len(ACCOUNTS) == 1 else None
     i = bisect.bisect_right([x for x, _ in t], ms)
     return t[i - 1][1] if i else t[0][1]
 
