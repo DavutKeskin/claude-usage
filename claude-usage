@@ -31,17 +31,23 @@ ACCOUNTS = []      # [(config dizini, etiket, plan çarpanı)] — etiket başı
 HISTORY_DIRS = []  # [(config dizini, etiket)] — aynı hesaba ait tüm dizinler
 CAPACITY_1X = {}   # {"week": $, "fable": $, "five": $} — 1x plan kapasitesi (isteğe bağlı)
 
-# $/M token: (input, output, cache yazma, cache okuma)
+# $/M token: (input, output, 5 dk cache yazma, cache okuma); 1 saatlik cache yazma = 2 × input.
+# Anahtar model adının önekidir, en uzun eşleşen kullanılır (claude-opus-5-5 ≠ claude-opus-5).
 PRICE = {
     "claude-fable-5-1": (10, 50, 12.5, 0.25),
-    "claude-fable-5":   (10, 50, 12.5, 0.25),
+    "claude-fable-5":   (10, 50, 12.5, 1),
+    "claude-opus-5-5":  (4, 20, 5, 0.2),
     "claude-opus-5":    (5, 25, 6.25, 0.5),
     "claude-opus-4-8":  (5, 25, 6.25, 0.5),
     "claude-opus-4-7":  (5, 25, 6.25, 0.5),
+    "claude-sonnet-5-5": (2, 10, 2.5, 0.1),
     "claude-sonnet-5":  (2, 10, 2.5, 0.2),
     "claude-sonnet-4-6": (3, 15, 3.75, 0.3),
+    "claude-haiku-5-5": (0.1, 0.5, 0.125, 0.01),
     "claude-haiku-4-5": (1, 5, 1.25, 0.1),
 }
+# İstem (input + cache) eşiği aşınca tüm fiyatlar çarpanla artar: {önek: (eşik, çarpan)}
+LONG_PROMPT = {"claude-haiku-5-5": (100_000, 5)}
 DEFAULT_PRICE = (5, 25, 6.25, 0.5)
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 # ───────────────────────────────────────────────────────────────────────────
@@ -143,19 +149,34 @@ def fmt(n):
 def price_for(model):
     if not model or model == "<synthetic>":
         return None
-    for k, v in PRICE.items():
-        if model.startswith(k):
-            return v
-    return DEFAULT_PRICE
+    k = max((k for k in PRICE if model.startswith(k)), key=len, default=None)
+    return PRICE[k] if k else DEFAULT_PRICE
+
+
+def cache_writes(u):
+    """(5 dk, 1 saat) cache yazma tokenları. Çok iterasyonlu yanıtta üst düzey cache_creation
+    kırılımı eksik kalabildiği için executor iterasyonlarından toplanır."""
+    its = [x for x in u.get("iterations") or [] if x.get("type") == "message"] or [u]
+    w5 = w1 = 0
+    for x in its:
+        cc = x.get("cache_creation_input_tokens", 0)
+        h = min(cc, (x.get("cache_creation") or {}).get("ephemeral_1h_input_tokens", 0))
+        w5, w1 = w5 + cc - h, w1 + h
+    return w5, w1
 
 
 def cost(model, u):
     p = price_for(model)
     if not p:
         return 0.0
-    return (u.get("input_tokens", 0) * p[0] + u.get("output_tokens", 0) * p[1]
-            + u.get("cache_creation_input_tokens", 0) * p[2]
-            + u.get("cache_read_input_tokens", 0) * p[3]) / 1e6
+    w5, w1 = cache_writes(u)
+    c = (u.get("input_tokens", 0) * p[0] + u.get("output_tokens", 0) * p[1]
+         + w5 * p[2] + w1 * 2 * p[0] + u.get("cache_read_input_tokens", 0) * p[3]) / 1e6
+    for k, (limit, factor) in LONG_PROMPT.items():
+        if model.startswith(k) and (u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
+                                    + u.get("cache_read_input_tokens", 0)) > limit:
+            c *= factor
+    return c
 
 
 def is_fable(model):
@@ -184,7 +205,7 @@ def loc(s):
 def fetch_limits(cfg, live=True):
     """{'five':%, 'five_reset', 'week':%, 'week_reset', 'week_start', 'fable':%, 'source'}"""
     out = {"five": None, "five_reset": None, "week": None, "week_reset": None,
-           "week_start": None, "fable": None, "fable_reset": None, "source": None}
+           "week_start": None, "fable": None, "fable_reset": None, "source": None, "age_min": None}
     d = cfg
     j = None
     if live:
@@ -198,7 +219,7 @@ def fetch_limits(cfg, live=True):
                     "anthropic-beta": "oauth-2025-04-20",
                     "User-Agent": "claude-code", "Accept": "application/json"})
                 j = json.load(urllib.request.urlopen(req, timeout=20))
-                out["source"] = "canlı"
+                out["source"], out["age_min"] = "canlı", 0
             else:
                 out["source"] = "token süresi dolmuş → önbellek"
         except Exception as e:  # noqa
@@ -208,7 +229,7 @@ def fetch_limits(cfg, live=True):
             c = claude_json(d).get("cachedUsageUtilization")
             if c:
                 j = c["utilization"]
-                age = (time.time() * 1000 - c.get("fetchedAtMs", 0)) / 60000
+                age = out["age_min"] = (time.time() * 1000 - c.get("fetchedAtMs", 0)) / 60000
                 out["source"] = (out["source"] or "önbellek") + f" ({age:.0f} dk önce)"
         except Exception:
             pass
@@ -274,7 +295,9 @@ def account_for(tl, sid, ms):
 
 # ── Transcript tarama ──────────────────────────────────────────────────────
 def scan(since_dt, tl, titles):
-    """Her mesaj için (dt, acct, proj, sid, model, usage) üretir; titles[sid] = ai-title."""
+    """Her mesaj için (dt, acct, proj, sid, model, usage, advisor_mu) üretir; titles[sid] = ai-title.
+    Advisor alt çağrıları üst düzey usage'a dahil değildir (usage.iterations); advisor modeliyle
+    ayrı kayıt olarak üretilir."""
     seen = set()
     home_enc = HOME.replace("/", "-")
     names = {}   # proje dizini -> görünen ad (transcript'teki ilk cwd)
@@ -294,6 +317,9 @@ def scan(since_dt, tl, titles):
         sid = rel[1].replace(".jsonl", "")
         rest = pdir[len(home_enc):] if pdir.startswith(home_enc) else pdir
         fallback = ("~/" + rest.lstrip("-")) if pdir.startswith(home_enc) and rest else ("~" if not rest else pdir)
+        # Yanıt, içerik bloğu başına bir satır olarak yazılır; ilk satırların output_tokens'ı
+        # stream sırasında eksik kalabilir → anahtar başına en büyük output'lu satır alınır.
+        msgs = {}   # (message.id, requestId) -> (ilk zaman, model, usage)
         for line in fh:
             try:
                 j = json.loads(line)
@@ -302,7 +328,6 @@ def scan(since_dt, tl, titles):
             if pdir not in names and j.get("cwd"):
                 c = j["cwd"]
                 names[pdir] = "~" + c[len(HOME):] if c == HOME or c.startswith(HOME + "/") else c
-            proj = names.get(pdir, fallback)
             t = j.get("type")
             if t == "ai-title" and j.get("aiTitle"):
                 titles[sid] = j["aiTitle"]
@@ -314,11 +339,20 @@ def scan(since_dt, tl, titles):
             if not u or not ts:
                 continue
             key = (m.get("id"), j.get("requestId"))
+            old = msgs.get(key)
+            if not old or u.get("output_tokens", 0) >= old[2].get("output_tokens", 0):
+                msgs[key] = (old[0] if old else ts, m.get("model", ""), u)
+        proj = names.get(pdir, fallback)
+        for key, (ts, model, u) in msgs.items():
             if key in seen:
                 continue
             seen.add(key)
             dt = parse_ts(ts)
-            yield dt, account_for(tl, sid, dt.timestamp() * 1000), proj, sid, m.get("model", ""), u
+            acct = account_for(tl, sid, dt.timestamp() * 1000)
+            yield dt, acct, proj, sid, model, u, False
+            for it in u.get("iterations") or []:
+                if it.get("type") == "advisor_message":
+                    yield dt, acct, proj, sid, it.get("model") or "", it, True
 
 
 # ── Ana ────────────────────────────────────────────────────────────────────
@@ -390,7 +424,7 @@ def report(a):
     scst = defaultdict(float)                       # (acct, day, sid) maliyet
     sfab = defaultdict(float)                       # (acct, day, sid) fable maliyeti
     sess_proj = {}                                  # sid -> proj
-    for dt, acct, proj, sid, model, u in scan(since, tl, titles):
+    for dt, acct, proj, sid, model, u, adv in scan(since, tl, titles):
         if not acct:
             continue
         c = cost(model, u)
@@ -409,17 +443,17 @@ def report(a):
             tok[k]["out"] += u.get("output_tokens", 0)
             tok[k]["cc"] += u.get("cache_creation_input_tokens", 0)
             tok[k]["cr"] += u.get("cache_read_input_tokens", 0)
-            tok[k]["n"] += 1
+            tok[k]["n"] += not adv
             dcost[k] += c
             if is_fable(model):
                 dfable[k] += c
-            mdl[(acct, day, model)] += u.get("output_tokens", 0)
+            mdl[(acct, day, model + (" (advisor)" if adv else ""))] += u.get("output_tokens", 0)
             ks = (acct, day, sid)
             stok[ks]["out"] += u.get("output_tokens", 0)
             stok[ks]["total"] += (u.get("input_tokens", 0) + u.get("output_tokens", 0)
                                   + u.get("cache_creation_input_tokens", 0)
                                   + u.get("cache_read_input_tokens", 0))
-            stok[ks]["n"] += 1
+            stok[ks]["n"] += not adv
             scst[ks] += c
             if is_fable(model):
                 sfab[ks] += c
@@ -437,9 +471,15 @@ def report(a):
     # Kapasite kalibrasyonu: hesap başına "yerel maliyet / yüzde" → 1x kapasite.
     # Hesap başka makinelerden de kullanılıyorsa yerel maliyet düşük kalır; bu yüzden
     # hesaplar arasında en büyük 1x tahmini alınır (paylaşılan hesap için daha doğru).
+    # Eski önbellekteki yüzde, o andan sonraki yerel maliyetle bölününce kapasiteyi
+    # şişirir; taze (≤ 60 dk) kaynak varsa yalnızca onlar kullanılır.
+    fresh = [l for l, L in limits.items() if L["age_min"] is not None and L["age_min"] <= 60]
+
     def capacity(key_cost, key_pct, key_cfg):
         best = CAPACITY_1X.get(key_cfg, 0.0)
         for _, label, m in ACCOUNTS:
+            if fresh and label not in fresh:
+                continue
             p = limits[label].get(key_pct)
             c = key_cost[label]
             if p and p > 0 and c > 0:
@@ -552,7 +592,8 @@ def report(a):
             print("bu pencerede yerel kullanım yok")
         print()
 
-    print("Notlar: maliyetler API liste fiyatıyla tahmindir; limit payları kalibrasyona dayalıdır "
+    print("Notlar: maliyetler API liste fiyatıyla tahmindir (1 saatlik cache yazma 2 × input; advisor "
+          "alt çağrıları advisor modelinin fiyatıyla dahil); limit payları kalibrasyona dayalıdır "
           "(plan çarpanı credentials'tan okunur). Hesaplar arası --resume yapılan oturumlarda "
           "her yanıt, önceki istemi gönderen hesaba yazılır.")
 
