@@ -2,16 +2,35 @@
 # claude-usage kurulumu.
 #   ./install.sh            betiği ~/.local/bin altına kurar
 #   ./install.sh --timer    ayrıca her sabah 09:00'da rapor yazan systemd kullanıcı zamanlayıcısını kurar
+# Depoyu klonlamadan:
+#   curl -fsSL https://raw.githubusercontent.com/DavutKeskin/claude-usage/main/install.sh | bash [-s -- --timer]
 # Rapor dizini: CLAUDE_USAGE_DIR (varsayılan ~/claude-usage)
 set -euo pipefail
 
-SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/claude-usage"
+RAW="${CLAUDE_USAGE_RAW:-https://raw.githubusercontent.com/DavutKeskin/claude-usage/main}"
 BIN="$HOME/.local/bin"
 OUT="${CLAUDE_USAGE_DIR:-$HOME/claude-usage}"
 
 command -v python3 >/dev/null || { echo "python3 gerekli (>= 3.8)"; exit 1; }
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)' \
   || { echo "Python 3.8 veya üstü gerekli: $(python3 --version)"; exit 1; }
+
+# Dosya olarak çalıştırıldıysa yanındaki betik; curl | bash ile geldiyse GitHub'dan indirilir.
+SELF="${BASH_SOURCE[0]:-}"
+if [ -n "$SELF" ] && [ -f "$(dirname "$SELF")/claude-usage" ]; then
+  SRC="$(cd "$(dirname "$SELF")" && pwd)/claude-usage"
+else
+  SRC="$(mktemp)"
+  trap 'rm -f "$SRC"' EXIT
+  if command -v curl >/dev/null; then
+    curl -fsSL "$RAW/claude-usage" -o "$SRC"
+  elif command -v wget >/dev/null; then
+    wget -qO "$SRC" "$RAW/claude-usage"
+  else
+    echo "İndirmek için curl veya wget gerekli"; exit 1
+  fi
+  head -1 "$SRC" | grep -q python3 || { echo "İndirme başarısız: $RAW/claude-usage"; exit 1; }
+fi
 
 mkdir -p "$BIN"
 install -m 755 "$SRC" "$BIN/claude-usage"

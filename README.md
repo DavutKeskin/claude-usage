@@ -7,11 +7,23 @@ standart kütüphanesi, yapılandırma gerektirmez.
 
 ## Kurulum
 
+Tek satırda (depoyu klonlamadan):
+
 ```bash
-git clone <depo> && cd claude-usage     # veya klasörü kopyalayın
+curl -fsSL https://raw.githubusercontent.com/DavutKeskin/claude-usage/main/install.sh | bash
+# + her sabah 09:00'da rapor (systemd; yoksa crontab satırı önerir):
+curl -fsSL https://raw.githubusercontent.com/DavutKeskin/claude-usage/main/install.sh | bash -s -- --timer
+```
+
+veya klonlayarak:
+
+```bash
+git clone https://github.com/DavutKeskin/claude-usage.git && cd claude-usage
 ./install.sh                             # ~/.local/bin/claude-usage
 ./install.sh --timer                     # + her sabah 09:00'da rapor (systemd)
 ```
+
+Güncellemek için aynı komutu yeniden çalıştırın.
 
 Gereksinim: Python 3.8+, Linux veya macOS. Rapor dizini `CLAUDE_USAGE_DIR` ile değişir
 (varsayılan `~/claude-usage`).
@@ -117,3 +129,7 @@ yazma 2 × input alınır); anahtar model adının önekidir, en uzun eşleşen 
 Her şey yerelde kalır. Ağa yalnızca limit yüzdeleri için, kendi OAuth token'ınızla
 `api.anthropic.com` adresine gidilir; `--no-live` bunu da kapatır. Raporlar oturum
 başlıklarınızı içerir, başkasıyla paylaşırken `--no-titles` kullanın.
+
+## Lisans
+
+MIT, bkz. [LICENSE](LICENSE).
