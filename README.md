@@ -13,6 +13,8 @@ Tek satırda (depoyu klonlamadan):
 curl -fsSL https://raw.githubusercontent.com/DavutKeskin/claude-usage/main/install.sh | bash
 # + her sabah 09:00'da rapor (systemd; yoksa crontab satırı önerir):
 curl -fsSL https://raw.githubusercontent.com/DavutKeskin/claude-usage/main/install.sh | bash -s -- --timer
+# + Claude Code status line'ı ve limit uyarıları:
+curl -fsSL https://raw.githubusercontent.com/DavutKeskin/claude-usage/main/install.sh | bash -s -- --hook
 ```
 
 veya klonlayarak:
@@ -21,6 +23,7 @@ veya klonlayarak:
 git clone https://github.com/DavutKeskin/claude-usage.git && cd claude-usage
 ./install.sh                             # ~/.local/bin/claude-usage
 ./install.sh --timer                     # + her sabah 09:00'da rapor (systemd)
+./install.sh --hook                      # + status line ve limit uyarıları (bkz. aşağıda)
 ```
 
 Güncellemek için aynı komutu yeniden çalıştırın.
@@ -41,6 +44,34 @@ claude-usage --json           # ham veri
 ```
 
 Çıktı Markdown'dır; terminalde okunur, `glow` veya bir editörle tablo olarak görünür.
+
+## Status line ve uyarılar
+
+`install.sh --hook` (ya da `claude-usage --install-hooks`) bulunan her config dizininin
+`settings.json` dosyasına bir status line ve iki hook ekler; önce `settings.json.claude-usage.bak`
+yedeği alınır. Başka bir status line tanımlıysa ona dokunulmaz. Kaldırmak için
+`claude-usage --uninstall-hooks`.
+
+```
+Opus 5.5 · bağlam 452K (~$0.09/istek) · oturum $23 · 5s %88 →17:04 · hafta %77 (süre %64) ⚠ ~Cmt 00:03 dolar
+```
+
+- **Status line:** model, bağlam boyutu (200K üstünde istek başına en az cache okuma
+  maliyeti), oturumun maliyeti (Claude Code'un kendi tahmini), 5 saatlik ve haftalık limit.
+  "süre" haftanın geçen kısmıdır; kullanım bunun önündeyse hafta ortalamasıyla limitin
+  ne zaman dolacağı gösterilir. Önbellek soğuduğunda sonraki isteğin yeniden yazma maliyeti
+  görünür. Veri Claude Code'un status line'a verdiği JSON'dan gelir; ağa çıkmaz.
+- **Stop hook:** bir eşik ilk kez aşıldığında yanıtın altında tek satır uyarı gösterir:
+  5 saatlik %70 / 85 / 95, haftalık %75 / 90 / 95, haftalık kullanım geçen sürenin 15 puan
+  önünde, bağlam 400K / 700K token. Aynı eşik aynı pencerede bir daha gösterilmez.
+- **SessionStart hook:** soğumuş bir oturuma `--resume` ile dönerken ilk mesajın tüm
+  bağlamı yeniden yazacağını ve yaklaşık maliyetini; hesap eşik üstündeyse durumunu söyler.
+
+Eşikler betiğin başındaki `FIVE_ALERTS`, `WEEK_ALERTS`, `PACE_ALERT`, `CONTEXT_ALERTS`
+değerleridir. Durum dosyaları `~/.local/state/claude-usage/` altındadır. Fable'a özel haftalık
+limit status line verisinde yoktur; onun için raporu kullanın. Status line'daki oturum maliyeti
+Claude Code'un tahminidir ve rapordakinden biraz yüksek çıkabilir (rapor transcript'te
+görünmeyen yan çağrıları sayamaz).
 
 ## Örnek çıktı (kısaltılmış)
 
@@ -84,12 +115,15 @@ proje ve oturumun payını buna göre hesaplar. Claude'da günlük limit yoktur;
 5 saatlik ve 7 günlüktür.
 
 > **Paylaşılan hesap uyarısı.** Hesabı başkaları da kullanıyorsa yerel kullanım yüzdenin
-> tamamını açıklamaz ve paylar olduğundan yüksek çıkar. Bu durumda 1x plan kapasitesini
-> elle verin. Ekim 2026'da tek kullanıcılı bir Max 5x hesapta ölçülen değerler (liste
-> fiyatıyla, 1x başına): haftalık ≈ 118 $, Fable haftalık ≈ 37 $, 5 saatlik ≈ 16 $ (5 saatlik
-> değer küçük örnekten, kaba). Eylül'deki 126 / 37 / 10 $ eski fiyat modeliyle ölçülmüştü.
-> Birden çok hesabınız varsa betik en güvenilir hesabı kendisi seçer ve paylaşılan hesabı
-> "⚠ hesabın %N'i başka makine/kişiden" diye işaretler.
+> tamamını açıklamaz; yalnızca yerel kullanımdan kalibre edilen kapasite küçük, paylar
+> olduğundan yüksek çıkar. Ekim 2026'da tek kullanıcılı bir Max 5x hesapta ölçülen değerler
+> (liste fiyatıyla, 1x başına): haftalık ≈ 118 $, Fable haftalık ≈ 37 $, 5 saatlik ≈ 16 $
+> (5 saatlik değer küçük örnekten, kaba). Eylül'deki 126 / 37 / 10 $ eski fiyat modeliyle
+> ölçülmüştü. Makinede tek hesap varsa bu değerler kapasiteye taban olarak kullanılır; hesabı
+> yalnız ve ağırlıklı Fable ile kullanıyorsanız gerçek kapasiteniz daha düşük olabilir,
+> o durumda kendi değerinizi `--capacity-1x-week` ya da `capacity_1x` ile verin. Birden çok
+> hesabınız varsa betik en güvenilir hesabı kendisi seçer. Her iki durumda paylaşılan hesap
+> "⚠ hesabın %N'i başka makine/kişiden" diye işaretlenir.
 
 ## Yapılandırma (isteğe bağlı)
 
@@ -127,7 +161,8 @@ yazma 2 × input alınır); anahtar model adının önekidir, en uzun eşleşen 
 ## Gizlilik
 
 Her şey yerelde kalır. Ağa yalnızca limit yüzdeleri için, kendi OAuth token'ınızla
-`api.anthropic.com` adresine gidilir; `--no-live` bunu da kapatır. Raporlar oturum
+`api.anthropic.com` adresine gidilir; `--no-live` bunu da kapatır. Status line ve hook'lar
+ağa hiç çıkmaz. Raporlar oturum
 başlıklarınızı içerir, başkasıyla paylaşırken `--no-titles` kullanın.
 
 ## Lisans

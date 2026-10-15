@@ -19,7 +19,7 @@ Veri kaynakları (hepsi yerel; yalnızca limit yüzdeleri için api.anthropic.co
   - <config>/.credentials.json     OAuth token → /api/oauth/usage (canlı limit yüzdeleri)
   - <config>/.claude.json          cachedUsageUtilization (token süresi dolmuşsa yedek)
 """
-import argparse, bisect, glob, json, os, re, subprocess, sys, time, urllib.request, urllib.error
+import argparse, bisect, glob, hashlib, json, os, re, subprocess, sys, time, urllib.request, urllib.error
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -30,6 +30,8 @@ CONFIG_FILE = os.path.join(HOME, ".config", "claude-usage", "config.json")
 ACCOUNTS = []      # [(config dizini, etiket, plan çarpanı)] — etiket başına tek satır
 HISTORY_DIRS = []  # [(config dizini, etiket)] — aynı hesaba ait tüm dizinler
 CAPACITY_1X = {}   # {"week": $, "fable": $, "five": $} — 1x plan kapasitesi (isteğe bağlı)
+# Tek hesap bulunduğunda kapasite tabanı (Ekim 2026, tek kullanıcılı Max 5x; README: Kalibrasyon)
+REFERENCE_1X = {"week": 118, "fable": 37, "five": 16}
 
 # $/M token: (input, output, 5 dk cache yazma, cache okuma); 1 saatlik cache yazma = 2 × input.
 # Anahtar model adının önekidir, en uzun eşleşen kullanılır (claude-opus-5-5 ≠ claude-opus-5).
@@ -50,6 +52,15 @@ PRICE = {
 LONG_PROMPT = {"claude-haiku-5-5": (100_000, 5)}
 DEFAULT_PRICE = (5, 25, 6.25, 0.5)
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+# Status line ve uyarı hook'ları (--statusline, --hook)
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state"),
+                         "claude-usage")
+FIVE_ALERTS = (70, 85, 95)            # 5 saatlik pencere yüzdesi eşikleri
+WEEK_ALERTS = (75, 90, 95)            # haftalık pencere yüzdesi eşikleri
+PACE_ALERT = 15                       # haftalık kullanım geçen sürenin bu kadar puan önündeyse uyar
+CONTEXT_ALERTS = (400_000, 700_000)   # bağlam boyutu (token) eşikleri
+COLD_CACHE_MIN = 50_000               # bundan küçük bağlamda soğuk cache uyarısı yok
 # ───────────────────────────────────────────────────────────────────────────
 
 
@@ -355,8 +366,371 @@ def scan(since_dt, tl, titles):
                     yield dt, acct, proj, sid, it.get("model") or "", it, True
 
 
+# ── Status line ve uyarı hook'ları ─────────────────────────────────────────
+# Status line, Claude Code'un verdiği oturum verisini (rate_limits, bağlam, maliyet, cache) gösterir
+# ve durum dosyasına yazar; hook'lar ağa ya da transcript taramasına gitmeden bu dosyayı okur.
+DAYS_TR = ("Pzt", "Sal", "Çar", "Per", "Cum", "Cmt", "Paz")
+
+
+def config_dir_of(transcript_path):
+    """Oturumun hesabı = transcript'in bulunduğu config dizini (<config>/projects/…)."""
+    i = (transcript_path or "").rfind("/projects/")
+    if i > 0:
+        return transcript_path[:i]
+    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
+
+
+def account_key(d):
+    d = os.path.abspath(d)
+    return os.path.basename(d).lstrip(".") + "-" + hashlib.sha1(d.encode()).hexdigest()[:6]
+
+
+def state_path(kind, key):
+    return os.path.join(STATE_DIR, kind, f"{key}.json")
+
+
+def write_text(path, text):
+    """Atomik yazma: okuyan taraf yarım dosya görmez."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def write_json(path, obj):
+    write_text(path, json.dumps(obj, ensure_ascii=False))
+
+
+def hm(ts):
+    """Bugünse SS:DD, değilse 'Cmt 04:00'."""
+    t = datetime.fromtimestamp(ts).astimezone()
+    if t.date() == datetime.now().astimezone().date():
+        return t.strftime("%H:%M")
+    return f"{DAYS_TR[t.weekday()]} {t:%H:%M}"
+
+
+def window(rl, name, now):
+    """(yüzde, sıfırlanma epoch) ya da None — pencere yoksa ya da çoktan sıfırlandıysa."""
+    w = (rl or {}).get(name) or {}
+    u, r = w.get("used_percentage"), w.get("resets_at")
+    return (float(u), float(r)) if u is not None and r and r > now else None
+
+
+def week_pace(used, reset, now):
+    """(geçen süre %, hafta ortalamasıyla dolma zamanı ya da None)."""
+    start = reset - 7 * 86400
+    elapsed = max(now - start, 1)
+    fill = start + elapsed * 100 / used if used > 0 else None
+    return 100 * elapsed / (7 * 86400), (fill if fill and fill < reset else None)
+
+
+def merge_limits(old, new):
+    """Hesabın bilinen en taze limitleri. Her oturum yalnızca kendi son yanıtının rate_limits'ini
+    görür; boşta bekleyen bir oturumun eski değeri taze veriyi ezmesin diye aynı pencerede en
+    yüksek yüzde, daha yeni pencere gelirse o alınır."""
+    out = dict(old or {})
+    for name, w in (new or {}).items():
+        o = out.get(name) or {}
+        if not isinstance(w, dict) or not w.get("resets_at"):
+            continue
+        r, ro = w["resets_at"], o.get("resets_at") or 0
+        if r > ro + 600 or (abs(r - ro) <= 600
+                            and (w.get("used_percentage") or 0) >= (o.get("used_percentage") or 0)):
+            out[name] = w
+    return out
+
+
+def context_tokens(cw):
+    u = (cw or {}).get("current_usage") or {}
+    return sum(u.get(k) or 0 for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+
+
+def money(c):
+    return f"${c:.2f}" if c < 10 else f"${c:.0f}"
+
+
+def statusline():
+    try:
+        j = json.load(sys.stdin)
+    except ValueError:
+        j = {}
+    m = j.get("model") or {}
+    try:
+        print(statusline_text(j, time.time()))
+    except Exception:   # status line hiçbir zaman boş kalmasın
+        print(m.get("display_name") or m.get("id") or "Claude")
+
+
+def statusline_text(j, now):
+    Y, R, Z = "\033[33m", "\033[31m", "\033[0m"
+    m = j.get("model") or {}
+    mid = m.get("id") or ""
+    p = price_for(mid) or DEFAULT_PRICE
+    ctx = context_tokens(j.get("context_window"))
+    cost_usd = (j.get("cost") or {}).get("total_cost_usd")
+    rl = j.get("rate_limits") or {}
+    pc = j.get("prompt_cache") or {}
+    sid = j.get("session_id")
+    d = config_dir_of(j.get("transcript_path"))
+    if sid:
+        st = {"at": now, "dir": d, "model": mid, "ctx": ctx, "cost": cost_usd, "rate_limits": rl}
+        write_json(state_path("session", sid), st)
+        acct_p = state_path("account", account_key(d))
+        merged = merge_limits(_read_json(acct_p).get("rate_limits"), rl)
+        if merged:
+            rl = merged
+            write_json(acct_p, {"at": now, "dir": d, "rate_limits": merged})
+    parts = [m.get("display_name") or mid or "Claude"]
+
+    if ctx:
+        s = f"bağlam {ctx // 1000}K"
+        if ctx >= 200_000:
+            s += f" (~{money(ctx * p[3] / 1e6)}/istek)"
+        col = R if ctx >= CONTEXT_ALERTS[1] else Y if ctx >= CONTEXT_ALERTS[0] else ""
+        parts.append(col + s + (Z if col else ""))
+    if cost_usd is not None:
+        parts.append(f"oturum {money(cost_usd)}")
+    five = window(rl, "five_hour", now)
+    if five:
+        u, r = five
+        col = R if u >= FIVE_ALERTS[1] else Y if u >= FIVE_ALERTS[0] else ""
+        parts.append(f"{col}5s %{u:.0f} →{hm(r)}{Z if col else ''}")
+    week = window(rl, "seven_day", now)
+    if week:
+        u, r = week
+        el, fill = week_pace(u, r, now)
+        s = f"hafta %{u:.0f} (süre %{el:.0f})"
+        if fill and u - el >= 5:
+            s += f" ⚠ ~{hm(fill)} dolar"
+        col = R if u >= WEEK_ALERTS[1] else Y if u >= WEEK_ALERTS[0] or u - el >= PACE_ALERT else ""
+        parts.append(col + s + (Z if col else ""))
+    # Soğuk cache: sonraki istek tüm bağlamı yeniden yazar (1 saatlik yazma 2 × input)
+    if pc and (not pc.get("warm") or (pc.get("expires_at") or now) < now):
+        tok = pc.get("recache_tokens_if_cold") or ctx
+        if tok >= COLD_CACHE_MIN:
+            w = 2 * p[0] if pc.get("ttl") == "1h" else p[2]
+            parts.append(f"{Y}❄ cache soğuk: sonraki istek ~{money(tok * w / 1e6)}{Z}")
+    return " · ".join(parts)
+
+
+def account_label(d):
+    return (claude_json(d).get("oauthAccount") or {}).get("emailAddress") or os.path.basename(d)
+
+
+def limit_alerts(st, now, seen):
+    """Hesap limitleri için yeni eşik geçişleri; seen (hesap başına) günceller."""
+    msgs = []
+    rl = st.get("rate_limits") or {}
+    five = window(rl, "five_hour", now)
+    if five:
+        u, r = five
+        k = str(round(r / 600))   # resets_at saniye kayabilir: 10 dk'ya yuvarla
+        prev = (seen.get("five") or {}).get(k, 0)
+        thr = max((t for t in FIVE_ALERTS if u >= t), default=0)
+        if thr > prev:
+            msgs.append(f"5 saatlik limit %{u:.0f} (sıfırlanma {hm(r)})")
+        seen["five"] = {k: max(thr, prev)}
+    week = window(rl, "seven_day", now)
+    if week:
+        u, r = week
+        k = str(round(r / 600))
+        prev = (seen.get("week") or {}).get(k) or [0, 0]
+        el, fill = week_pace(u, r, now)
+        thr = max((t for t in WEEK_ALERTS if u >= t), default=0)
+        band = int(u // 10) if u - el >= PACE_ALERT else 0   # hız uyarısı her 10 puanda bir
+        if thr > prev[0] or band > prev[1]:
+            s = f"haftalık limit %{u:.0f}, geçen süre %{el:.0f}"
+            s += (f"; bu ortalamayla {hm(fill)} civarı dolar, sıfırlanma {hm(r)}" if fill
+                  else f" (sıfırlanma {hm(r)})")
+            msgs.append(s)
+        seen["week"] = {k: [max(thr, prev[0]), max(band, prev[1])]}
+    return msgs
+
+
+def hook_stop(j, now):
+    if j.get("stop_hook_active") or not j.get("session_id"):
+        return None
+    st = _read_json(state_path("session", j["session_id"]))
+    if not st or now - st.get("at", 0) > 6 * 3600:
+        return None
+    d = st.get("dir") or config_dir_of(j.get("transcript_path"))
+    seen_p = state_path("alerts", account_key(d))
+    seen = _read_json(seen_p)
+    acct = _read_json(state_path("account", account_key(d)))
+    msgs = limit_alerts({"rate_limits": merge_limits(acct.get("rate_limits"), st.get("rate_limits"))},
+                        now, seen)
+
+    # Bağlam: oturum başına; /compact sonrası eşiğin altına inince sıfırlanır
+    ctx_p = state_path("session", j["session_id"] + ".alert")
+    prev = _read_json(ctx_p).get("ctx", 0)
+    ctx = st.get("ctx") or 0
+    thr = max((t for t in CONTEXT_ALERTS if ctx >= t), default=0)
+    if thr > prev:
+        p = price_for(st.get("model")) or DEFAULT_PRICE
+        s = (f"bağlam {ctx // 1000}K token: her istek en az ~{money(ctx * p[3] / 1e6)} (cache okuma); "
+             "konu değiştiyse /compact ya da yeni oturum")
+        if st.get("cost") is not None:
+            s += f". Bu oturum şimdiye dek ~{money(st['cost'])} (Claude Code tahmini)"
+        msgs.append(s)
+    if thr != prev:
+        write_json(ctx_p, {"ctx": thr})
+    write_json(seen_p, seen)
+    if msgs:
+        return {"systemMessage": f"⚠ claude-usage [{account_label(d)}]: " + "; ".join(msgs)}
+    return None
+
+
+def last_usage(path, tail=4 << 20):
+    """Transcript'teki son yanıt: (zaman, model, usage, 1 saatlik cache mi). Cache süresi son
+    yanıtlardaki cache yazmalarından anlaşılır; hiç yazma görülmezse 1 saat (abonelik varsayılanı)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - tail))
+            lines = f.read().decode("utf-8", "ignore").splitlines()
+    except OSError:
+        return None
+    last = None
+    for line in reversed(lines):
+        try:
+            x = json.loads(line)
+        except ValueError:
+            continue
+        msg = x.get("message") or {}
+        u = msg.get("usage")
+        if x.get("type") != "assistant" or not u or not x.get("timestamp") or x.get("isSidechain"):
+            continue
+        last = last or (parse_ts(x["timestamp"]).timestamp(), msg.get("model") or "", u)
+        cc = u.get("cache_creation") or {}
+        if cc.get("ephemeral_1h_input_tokens"):
+            return last + (True,)
+        if cc.get("ephemeral_5m_input_tokens"):
+            return last + (False,)
+    return last + (True,) if last else None
+
+
+def hook_session_start(j, now):
+    msgs = []
+    if j.get("source") == "resume" and j.get("transcript_path"):
+        r = last_usage(j["transcript_path"])
+        if r:
+            ts, model, u, one_hour = r
+            ctx = context_tokens({"current_usage": u})
+            age = now - ts
+            if ctx >= COLD_CACHE_MIN and age > (3600 if one_hour else 300):
+                p = price_for(model) or DEFAULT_PRICE
+                c = ctx * (2 * p[0] if one_hour else p[2]) / 1e6
+                ago = f"{age / 3600:.0f} saat" if age >= 5400 else f"{age / 60:.0f} dk"
+                msgs.append(f"önbellek soğudu (son yanıt {ago} önce): ilk mesaj {ctx // 1000}K token'ı "
+                            f"yeniden yazar, ~{money(c)} ({model} liste fiyatı). Konu değiştiyse yeni "
+                            "oturum daha ucuz")
+    d = config_dir_of(j.get("transcript_path"))
+    st = _read_json(state_path("account", account_key(d)))
+    if st and now - st.get("at", 0) < 12 * 3600:
+        rl = st.get("rate_limits") or {}
+        five, week = window(rl, "five_hour", now), window(rl, "seven_day", now)
+        s = []
+        if week and (week[0] >= WEEK_ALERTS[0] or week[0] - week_pace(*week, now)[0] >= PACE_ALERT):
+            el, fill = week_pace(*week, now)
+            s.append(f"haftalık %{week[0]:.0f} (geçen süre %{el:.0f}"
+                     + (f", bu ortalamayla {hm(fill)} civarı dolar)" if fill else ")"))
+        if five and five[0] >= FIVE_ALERTS[0]:
+            s.append(f"5 saatlik %{five[0]:.0f} (sıfırlanma {hm(five[1])})")
+        if s:
+            msgs.append(f"hesap durumu ({hm(st['at'])} itibarıyla): " + ", ".join(s))
+    # eski oturum durum dosyalarını temizle
+    for f in glob.glob(os.path.join(STATE_DIR, "session", "*.json")):
+        try:
+            if now - os.path.getmtime(f) > 7 * 86400:
+                os.remove(f)
+        except OSError:
+            pass
+    if msgs:
+        return {"systemMessage": f"claude-usage [{account_label(d)}]: " + "; ".join(msgs)}
+    return None
+
+
+def run_hook(event):
+    try:
+        j = json.load(sys.stdin)
+        out = (hook_stop if event == "stop" else hook_session_start)(j, time.time())
+        if out:
+            print(json.dumps(out, ensure_ascii=False))
+    except Exception as e:   # hook hiçbir zaman oturumu bozmasın
+        print(f"claude-usage --hook {event}: {type(e).__name__}: {e}", file=sys.stderr)
+
+
+# ── Ayar kurulumu ──────────────────────────────────────────────────────────
+HOOK_EVENTS = (("Stop", None, "--hook stop"), ("SessionStart", "startup|resume", "--hook session-start"))
+
+
+def install_hooks(remove=False):
+    """Bulunan her config dizininin settings.json'ına status line ve hook'ları ekler (ya da kaldırır)."""
+    exe = os.path.abspath(sys.argv[0])
+    dirs = []
+    for d, _ in HISTORY_DIRS:
+        if os.path.realpath(d) not in [os.path.realpath(x) for x in dirs]:
+            dirs.append(d)
+    for d in dirs:
+        path = os.path.join(d, "settings.json")
+        try:
+            with open(path) as f:
+                raw = f.read()
+            s = json.loads(raw) if raw.strip() else {}
+        except FileNotFoundError:
+            raw, s = "", {}
+        except ValueError:
+            print(f"{path}: geçerli JSON değil, dokunulmadı")
+            continue
+        notes = []
+        sl = s.get("statusLine") or {}
+        ours = "claude-usage --statusline" in (sl.get("command") or "")
+        if remove:
+            if ours:
+                del s["statusLine"]
+                notes.append("status line kaldırıldı")
+        elif not sl or ours:
+            s["statusLine"] = {"type": "command", "command": f"{exe} --statusline"}
+            notes.append("status line")
+        else:
+            notes.append("mevcut status line korundu (elle: " + exe + " --statusline)")
+        hooks = s.setdefault("hooks", {})
+        for event, matcher, arg in HOOK_EVENTS:
+            groups = hooks.get(event) or []
+            for g in groups:   # eski kurulumları (başka yol) temizle
+                g["hooks"] = [h for h in g.get("hooks") or [] if "claude-usage " + arg not in (h.get("command") or "")]
+            groups = [g for g in groups if g.get("hooks")]
+            if not remove:
+                g = {"hooks": [{"type": "command", "command": f"{exe} {arg}", "timeout": 5}]}
+                if matcher:
+                    g["matcher"] = matcher
+                groups.append(g)
+                notes.append(f"{event} hook")
+            if groups:
+                hooks[event] = groups
+            else:
+                hooks.pop(event, None)
+        if not hooks:
+            s.pop("hooks", None)
+        new = json.dumps(s, ensure_ascii=False, indent=2) + "\n"
+        if new == raw:
+            print(f"{path}: değişiklik yok")
+            continue
+        if raw:
+            write_text(path + ".claude-usage.bak", raw)
+        write_text(path, new)
+        print(f"{path}: " + ", ".join(notes) + (f" (yedek: {path}.claude-usage.bak)" if raw else ""))
+    if not remove:
+        print("Açık oturumlar yeni ayarları genelde kendiliğinden alır; almazsa Claude Code'u yeniden başlatın.")
+
+
 # ── Ana ────────────────────────────────────────────────────────────────────
 def main():
+    if sys.argv[1:2] == ["--statusline"]:   # her mesajda çalışır: ağır işlerden önce ayrıl
+        return statusline()
+    if sys.argv[1:2] == ["--hook"]:
+        return run_hook(sys.argv[2] if len(sys.argv) > 2 else "")
     ap = argparse.ArgumentParser(description="Claude Code kullanım raporu")
     ap.add_argument("-d", "--days", type=int, default=2, help="kaç gün geriye (varsayılan 2 = dün+bugün)")
     ap.add_argument("--no-live", action="store_true", help="API'ye gitme, önbellek kullan")
@@ -370,8 +744,17 @@ def main():
     ap.add_argument("--capacity-1x-week", type=float, metavar="USD",
                     help="1x planın haftalık kapasitesi ($, liste fiyatıyla). Paylaşılan tek "
                          "hesapta 'bu makinenin payı'nı doğru hesaplamak için; bkz. README")
+    ap.add_argument("--statusline", action="store_true",
+                    help="Claude Code status line'ı (stdin: Claude Code'un oturum JSON'u)")
+    ap.add_argument("--hook", choices=["stop", "session-start"],
+                    help="uyarı hook'u (stdin: hook JSON'u); limit eşiği aşılınca mesaj gösterir")
+    ap.add_argument("--install-hooks", action="store_true",
+                    help="bulunan her config dizininin settings.json'ına status line ve hook'ları ekle")
+    ap.add_argument("--uninstall-hooks", action="store_true", help="eklenenleri kaldır")
     a = ap.parse_args()
     discover_accounts()
+    if a.install_hooks or a.uninstall_hooks:
+        return install_hooks(remove=a.uninstall_hooks)
     if a.capacity_1x_week:
         CAPACITY_1X["week"] = a.capacity_1x_week
     if a.out and not a.json:
@@ -471,12 +854,14 @@ def report(a):
     # Kapasite kalibrasyonu: hesap başına "yerel maliyet / yüzde" → 1x kapasite.
     # Hesap başka makinelerden de kullanılıyorsa yerel maliyet düşük kalır; bu yüzden
     # hesaplar arasında en büyük 1x tahmini alınır (paylaşılan hesap için daha doğru).
+    # Tek hesapta karşılaştırma yapılamaz: referans değer taban olarak kullanılır.
     # Eski önbellekteki yüzde, o andan sonraki yerel maliyetle bölününce kapasiteyi
     # şişirir; taze (≤ 60 dk) kaynak varsa yalnızca onlar kullanılır.
     fresh = [l for l, L in limits.items() if L["age_min"] is not None and L["age_min"] <= 60]
+    ref = REFERENCE_1X if len(ACCOUNTS) == 1 else {}
 
     def capacity(key_cost, key_pct, key_cfg):
-        best = CAPACITY_1X.get(key_cfg, 0.0)
+        best = CAPACITY_1X.get(key_cfg) or ref.get(key_cfg, 0.0)
         for _, label, m in ACCOUNTS:
             if fresh and label not in fresh:
                 continue
@@ -525,9 +910,10 @@ def report(a):
               f"${wfable[label]:,.0f} | {share(wfable[label], cap_f.get(label))} | "
               f"${scost[label]:,.0f} | {share(scost[label], cap_s.get(label))} |")
     if len(ACCOUNTS) == 1 and "week" not in CAPACITY_1X:
-        print("\nNot: tek hesap bulunduğu için kapasite yalnızca bu makinenin kullanımından "
-              "kalibre edildi; hesap başkalarıyla paylaşılıyorsa paylar olduğundan yüksek çıkar. "
-              "Gerçek pay için --capacity-1x-week verin (README: Kalibrasyon).")
+        print(f"\nNot: tek hesap bulunduğu için kapasiteye referans taban kullanıldı (1x: haftalık "
+              f"{REFERENCE_1X['week']} $, Fable {REFERENCE_1X['fable']} $, 5 saatlik {REFERENCE_1X['five']} $). "
+              "Hesabı yalnız siz ve ağırlıklı Fable ile kullanıyorsanız paylar olduğundan düşük "
+              "çıkabilir; kendi değerinizi --capacity-1x-week ile verin (README: Kalibrasyon).")
 
     for day in days:
         title = labels.get(day, "")

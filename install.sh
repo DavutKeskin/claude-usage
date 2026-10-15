@@ -2,10 +2,20 @@
 # claude-usage kurulumu.
 #   ./install.sh            betiği ~/.local/bin altına kurar
 #   ./install.sh --timer    ayrıca her sabah 09:00'da rapor yazan systemd kullanıcı zamanlayıcısını kurar
+#   ./install.sh --hook     ayrıca Claude Code status line'ını ve limit uyarısı hook'larını kurar
 # Depoyu klonlamadan:
-#   curl -fsSL https://raw.githubusercontent.com/DavutKeskin/claude-usage/main/install.sh | bash [-s -- --timer]
+#   curl -fsSL https://raw.githubusercontent.com/DavutKeskin/claude-usage/main/install.sh | bash [-s -- --timer --hook]
 # Rapor dizini: CLAUDE_USAGE_DIR (varsayılan ~/claude-usage)
 set -euo pipefail
+
+TIMER=0 HOOK=0
+for arg in "$@"; do
+  case "$arg" in
+    --timer) TIMER=1 ;;
+    --hook) HOOK=1 ;;
+    *) echo "Bilinmeyen seçenek: $arg (--timer, --hook)"; exit 1 ;;
+  esac
+done
 
 RAW="${CLAUDE_USAGE_RAW:-https://raw.githubusercontent.com/DavutKeskin/claude-usage/main}"
 BIN="$HOME/.local/bin"
@@ -40,7 +50,11 @@ case ":$PATH:" in
   *) echo "Uyarı: $BIN PATH içinde değil. Kabuk profilinize ekleyin: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
 esac
 
-[ "${1:-}" = "--timer" ] || { echo "Deneyin: claude-usage"; exit 0; }
+if [ "$HOOK" = 1 ]; then
+  "$BIN/claude-usage" --install-hooks
+fi
+
+[ "$TIMER" = 1 ] || { echo "Deneyin: claude-usage"; exit 0; }
 
 if command -v systemctl >/dev/null && systemctl --user show-environment >/dev/null 2>&1; then
   UNIT="$HOME/.config/systemd/user"
