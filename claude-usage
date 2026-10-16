@@ -29,6 +29,8 @@ HOME = os.path.expanduser("~")
 CONFIG_FILE = os.path.join(HOME, ".config", "claude-usage", "config.json")
 ACCOUNTS = []      # [(config dizini, etiket, plan çarpanı)] — etiket başına tek satır
 HISTORY_DIRS = []  # [(config dizini, etiket)] — aynı hesaba ait tüm dizinler
+PAST_ACCOUNTS = [] # [(config dizini, etiket, plan çarpanı)] — dizinde eskiden oturum açmış hesaplar
+LOGINS = {}        # config dizini -> [(başlangıç ms, e-posta, tier)] (yalnızca otomatik keşifte)
 CAPACITY_1X = {}   # {"week": $, "fable": $, "five": $} — 1x plan kapasitesi (isteğe bağlı)
 # Tek hesap bulunduğunda kapasite tabanı (Ekim 2026, tek kullanıcılı Max 5x; README: Kalibrasyon)
 REFERENCE_1X = {"week": 118, "fable": 37, "five": 16}
@@ -100,6 +102,60 @@ def load_credentials(d):
     return j.get("claudeAiOauth") or {}
 
 
+def _email_tier(j):
+    a = (j or {}).get("oauthAccount") or {}
+    return a.get("emailAddress"), a.get("organizationRateLimitTier") or ""
+
+
+def tier_mult(tier):
+    m = re.search(r"(\d+)x", tier or "")
+    return int(m.group(1)) if m else 1
+
+
+def account_history(d, cur=None):
+    """Dizinde zaman içinde oturum açmış hesaplar: [(başlangıç ms, e-posta, tier)], eskiden yeniye.
+    Aynı dizinde /login ile hesap değişince eski kullanım eski hesaba yazılsın diye tutulur. Değişim
+    anı Claude Code'un <dir>/backups/.claude.json.backup.<ms> yedeklerinden bulunur (önceki hesabın
+    yerini başka bir şeyin ilk aldığı an); yedek yoksa değişimin fark edildiği an."""
+    p = state_path("logins", dir_key(d))
+    hist = [tuple(h) for h in _read_json(p).get("history") or []]
+    email, tier = cur or _email_tier(claude_json(d))
+    if not email or (hist and hist[-1][1] == email):
+        return hist or ([(0, email, tier)] if email else [])
+    prev = hist[-1][1] if hist else None
+    snaps = []
+    for f in glob.glob(os.path.join(d, "backups", ".claude.json.backup.*")):
+        try:
+            ms = int(f.rsplit(".", 1)[1])
+        except ValueError:
+            continue
+        if not hist or ms > hist[-1][0]:
+            snaps.append((ms, f))
+    away = None   # prev'in yerini ilk kez başka bir şeyin (çıkış ya da başka hesap) aldığı an
+    for ms, f in sorted(snaps):
+        e, t = _email_tier(_read_json(f))
+        if e == prev:
+            away = None
+        elif away is None:
+            away = ms
+        if e and e != prev:
+            hist.append((away if prev else 0, e, t))
+            prev, away = e, None
+    if prev != email:
+        hist.append(((away or int(time.time() * 1000)) if prev else 0, email, tier))
+    write_json(p, {"dir": os.path.abspath(d), "history": hist})
+    return hist
+
+
+def label_at(d, ms, default):
+    """d dizininde ms anında oturum açık hesap."""
+    h = LOGINS.get(d)
+    if not h:
+        return default
+    i = bisect.bisect_right([x[0] for x in h], ms)
+    return h[i - 1][1] if i else h[0][1]
+
+
 def discover_accounts():
     """ACCOUNTS / HISTORY_DIRS / CAPACITY_1X / PRICE değerlerini doldurur."""
     cfg = _read_json(CONFIG_FILE)
@@ -111,7 +167,8 @@ def discover_accounts():
     CAPACITY_1X.update({k: float(v) for k, v in cap.items() if v})
 
     found = []   # (dir, label, mult)
-    if cfg.get("accounts"):
+    auto = not cfg.get("accounts")
+    if not auto:
         for a in cfg["accounts"]:
             d = os.path.expanduser(a["dir"])
             found.append((d, a.get("label") or os.path.basename(d), a.get("multiplier")))
@@ -135,13 +192,21 @@ def discover_accounts():
             continue
         labels.add(label)
         if not mult:
-            tier = (load_credentials(d).get("rateLimitTier")
-                    or (claude_json(d).get("oauthAccount") or {}).get("organizationRateLimitTier") or "")
-            m = re.search(r"(\d+)x", tier)
-            mult = int(m.group(1)) if m else 1
+            mult = tier_mult(load_credentials(d).get("rateLimitTier")
+                             or (claude_json(d).get("oauthAccount") or {}).get("organizationRateLimitTier"))
         ACCOUNTS.append((d, label, mult))
     if not ACCOUNTS:
         sys.exit("Claude Code yapılandırma dizini bulunamadı (~/.claude, ~/.claude-*, $CLAUDE_CONFIG_DIR).")
+    if auto:
+        for d, _ in HISTORY_DIRS:
+            try:
+                LOGINS[d] = account_history(d)
+            except OSError:
+                continue
+            for _, e, t in LOGINS[d]:
+                if e not in labels:
+                    labels.add(e)
+                    PAST_ACCOUNTS.append((d, e, tier_mult(t)))
 
 
 def project_roots():
@@ -213,10 +278,14 @@ def loc(s):
 
 
 # ── Canlı limitler ─────────────────────────────────────────────────────────
+def no_limits(source=None):
+    return {"five": None, "five_reset": None, "week": None, "week_reset": None,
+            "week_start": None, "fable": None, "fable_reset": None, "source": source, "age_min": None}
+
+
 def fetch_limits(cfg, live=True):
     """{'five':%, 'five_reset', 'week':%, 'week_reset', 'week_start', 'fable':%, 'source'}"""
-    out = {"five": None, "five_reset": None, "week": None, "week_reset": None,
-           "week_start": None, "fable": None, "fable_reset": None, "source": None, "age_min": None}
+    out = no_limits()
     d = cfg
     j = None
     if live:
@@ -286,7 +355,7 @@ def load_timeline():
                 continue
             sid = j.get("sessionId")
             if sid and j.get("timestamp"):
-                tl[sid].append((j["timestamp"], label))
+                tl[sid].append((j["timestamp"], label_at(cfg, j["timestamp"], label)))
                 d = (j.get("display") or "").strip()
                 if d and not d.startswith("/") and (sid not in first or j["timestamp"] < first[sid][0]):
                     first[sid] = (j["timestamp"], d)
@@ -299,7 +368,7 @@ def account_for(tl, sid, ms):
     t = tl.get(sid)
     if not t:
         # history'de olmayan oturum (başka makineden taşınmış vb.): tek hesap varsa onundur
-        return ACCOUNTS[0][1] if len(ACCOUNTS) == 1 else None
+        return label_at(ACCOUNTS[0][0], ms, ACCOUNTS[0][1]) if len(ACCOUNTS) == 1 else None
     i = bisect.bisect_right([x for x, _ in t], ms)
     return t[i - 1][1] if i else t[0][1]
 
@@ -380,9 +449,15 @@ def config_dir_of(transcript_path):
     return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
 
 
-def account_key(d):
+def dir_key(d):
     d = os.path.abspath(d)
     return os.path.basename(d).lstrip(".") + "-" + hashlib.sha1(d.encode()).hexdigest()[:6]
+
+
+def account_key(d, email):
+    """Durum dosyası anahtarı: dizin + hesap. Aynı dizinde /login ile hesap değişirse yeni hesap
+    eskisinin limitlerini ve uyarı durumunu devralmaz."""
+    return dir_key(d) + "-" + hashlib.sha1(email.encode()).hexdigest()[:6]
 
 
 def state_path(kind, key):
@@ -474,13 +549,17 @@ def statusline_text(j, now):
     sid = j.get("session_id")
     d = config_dir_of(j.get("transcript_path"))
     if sid:
-        st = {"at": now, "dir": d, "model": mid, "ctx": ctx, "cost": cost_usd, "rate_limits": rl}
+        email, tier = _email_tier(claude_json(d))
+        email = email or os.path.basename(d)
+        account_history(d, (email, tier))   # hesap değiştiyse değişim anını kaydeder
+        st = {"at": now, "dir": d, "acct": email, "model": mid, "ctx": ctx, "cost": cost_usd,
+              "rate_limits": rl}
         write_json(state_path("session", sid), st)
-        acct_p = state_path("account", account_key(d))
+        acct_p = state_path("account", account_key(d, email))
         merged = merge_limits(_read_json(acct_p).get("rate_limits"), rl)
         if merged:
             rl = merged
-            write_json(acct_p, {"at": now, "dir": d, "rate_limits": merged})
+            write_json(acct_p, {"at": now, "dir": d, "acct": email, "rate_limits": merged})
     parts = [m.get("display_name") or mid or "Claude"]
 
     if ctx:
@@ -555,9 +634,10 @@ def hook_stop(j, now):
     if not st or now - st.get("at", 0) > 6 * 3600:
         return None
     d = st.get("dir") or config_dir_of(j.get("transcript_path"))
-    seen_p = state_path("alerts", account_key(d))
+    email = st.get("acct") or account_label(d)
+    seen_p = state_path("alerts", account_key(d, email))
     seen = _read_json(seen_p)
-    acct = _read_json(state_path("account", account_key(d)))
+    acct = _read_json(state_path("account", account_key(d, email)))
     msgs = limit_alerts({"rate_limits": merge_limits(acct.get("rate_limits"), st.get("rate_limits"))},
                         now, seen)
 
@@ -577,7 +657,7 @@ def hook_stop(j, now):
         write_json(ctx_p, {"ctx": thr})
     write_json(seen_p, seen)
     if msgs:
-        return {"systemMessage": f"⚠ claude-usage [{account_label(d)}]: " + "; ".join(msgs)}
+        return {"systemMessage": f"⚠ claude-usage [{email}]: " + "; ".join(msgs)}
     return None
 
 
@@ -626,7 +706,8 @@ def hook_session_start(j, now):
                             f"yeniden yazar, ~{money(c)} ({model} liste fiyatı). Konu değiştiyse yeni "
                             "oturum daha ucuz")
     d = config_dir_of(j.get("transcript_path"))
-    st = _read_json(state_path("account", account_key(d)))
+    email = account_label(d)
+    st = _read_json(state_path("account", account_key(d, email)))
     if st and now - st.get("at", 0) < 12 * 3600:
         rl = st.get("rate_limits") or {}
         five, week = window(rl, "five_hour", now), window(rl, "seven_day", now)
@@ -639,15 +720,16 @@ def hook_session_start(j, now):
             s.append(f"5 saatlik %{five[0]:.0f} (sıfırlanma {hm(five[1])})")
         if s:
             msgs.append(f"hesap durumu ({hm(st['at'])} itibarıyla): " + ", ".join(s))
-    # eski oturum durum dosyalarını temizle
-    for f in glob.glob(os.path.join(STATE_DIR, "session", "*.json")):
-        try:
-            if now - os.path.getmtime(f) > 7 * 86400:
-                os.remove(f)
-        except OSError:
-            pass
+    # eski durum dosyalarını temizle (logins/ hesap geçmişidir, silinmez)
+    for kind in ("session", "account", "alerts"):
+        for f in glob.glob(os.path.join(STATE_DIR, kind, "*.json")):
+            try:
+                if now - os.path.getmtime(f) > 8 * 86400:
+                    os.remove(f)
+            except OSError:
+                pass
     if msgs:
-        return {"systemMessage": f"claude-usage [{account_label(d)}]: " + "; ".join(msgs)}
+        return {"systemMessage": f"claude-usage [{email}]: " + "; ".join(msgs)}
     return None
 
 
@@ -787,7 +869,10 @@ def report(a):
         labels[days[-2]] = "Dün"
 
     limits = {label: fetch_limits(cfg, live=not a.no_live) for cfg, label, _ in ACCOUNTS}
-    mult = {label: m for _, label, m in ACCOUNTS}
+    for cfg, label, _ in PAST_ACCOUNTS:   # dizinde artık başka hesap açık: limitleri sorgulanamaz
+        limits[label] = no_limits(f"önceki hesap ({os.path.basename(cfg)} dizininde artık başka hesap açık)")
+    ALL = ACCOUNTS + PAST_ACCOUNTS
+    past = {label for _, label, _ in PAST_ACCOUNTS}
 
     since = today - timedelta(days=a.days - 1)
     for L in limits.values():
@@ -859,6 +944,7 @@ def report(a):
     # şişirir; taze (≤ 60 dk) kaynak varsa yalnızca onlar kullanılır.
     fresh = [l for l, L in limits.items() if L["age_min"] is not None and L["age_min"] <= 60]
     ref = REFERENCE_1X if len(ACCOUNTS) == 1 else {}
+    ref_used = set()
 
     def capacity(key_cost, key_pct, key_cfg):
         best = CAPACITY_1X.get(key_cfg) or ref.get(key_cfg, 0.0)
@@ -869,7 +955,10 @@ def report(a):
             c = key_cost[label]
             if p and p > 0 and c > 0:
                 best = max(best, c / (p / 100) / m)
-        return {label: best * m for _, label, m in ACCOUNTS} if best else {}
+        if not best:   # hiçbir hesapta kalibre edilecek yüzde yok (pencere yeni ya da yüzde 0)
+            best = REFERENCE_1X.get(key_cfg, 0.0)
+            ref_used.add(key_cfg)
+        return {label: best * m for _, label, m in ALL} if best else {}
 
     cap_w = capacity(wcost, "week", "week")
     cap_f = capacity(wfable, "fable", "fable")
@@ -890,7 +979,7 @@ def report(a):
     print("## Canlı limitler\n")
     print("| Hesap | 5 saatlik | Sıfırlanma | Haftalık | Fable haftalık | Haftalık sıfırlanma | Kaynak |")
     print("|---|---:|---|---:|---:|---|---|")
-    for _, label, _ in ACCOUNTS:
+    for _, label, _ in ALL:
         L = limits[label]
         pct = lambda v: f"%{v:.0f}" if v is not None else "?"
         print(f"| {label} | {pct(L['five'])} | {loc(L['five_reset'])} | {pct(L['week'])} | "
@@ -909,8 +998,9 @@ def report(a):
         print(f"| {label} | ${wcost[label]:,.0f} | {share(wcost[label], cap_w.get(label))}{note} | "
               f"${wfable[label]:,.0f} | {share(wfable[label], cap_f.get(label))} | "
               f"${scost[label]:,.0f} | {share(scost[label], cap_s.get(label))} |")
-    if len(ACCOUNTS) == 1 and "week" not in CAPACITY_1X:
-        print(f"\nNot: tek hesap bulunduğu için kapasiteye referans taban kullanıldı (1x: haftalık "
+    if (len(ACCOUNTS) == 1 and "week" not in CAPACITY_1X) or ref_used:
+        why = "tek hesap bulunduğu" if len(ACCOUNTS) == 1 else "canlı yüzdelerden kalibrasyon yapılamadığı"
+        print(f"\nNot: {why} için kapasiteye referans taban kullanıldı (1x: haftalık "
               f"{REFERENCE_1X['week']} $, Fable {REFERENCE_1X['fable']} $, 5 saatlik {REFERENCE_1X['five']} $). "
               "Hesabı yalnız siz ve ağırlıklı Fable ile kullanıyorsanız paylar olduğundan düşük "
               "çıkabilir; kendi değerinizi --capacity-1x-week ile verin (README: Kalibrasyon).")
@@ -918,11 +1008,12 @@ def report(a):
     for day in days:
         title = labels.get(day, "")
         print(f"\n## {title + ' ' if title else ''}({day})")
-        for _, label, _ in ACCOUNTS:
+        for _, label, _ in ALL:
             rows = [(k[2], v) for k, v in tok.items()
                     if k[0] == label and k[1] == day and (v["in"] + v["out"] + v["cc"] + v["cr"])]
             if not rows:
-                print(f"\n**{label}**: kullanım yok")
+                if label not in past:   # önceki hesap yalnızca kullanımı olan günlerde görünür
+                    print(f"\n**{label}**: kullanım yok")
                 continue
             tc = sum(dcost[(label, day, p)] for p, _ in rows)
             tf = sum(dfable[(label, day, p)] for p, _ in rows)

@@ -95,7 +95,7 @@ Oturumlar (en pahalı 2/10):
 | Veri | Kaynak |
 |---|---|
 | Token sayıları | `<config>/projects/**/*.jsonl` transcript'leri (alt ajanlar dahil). Bir yanıt içerik bloğu başına ayrı satıra yazılır ve ilk satırların output sayısı eksik olabilir; yanıt başına en tam satır alınır. Advisor (danışman) alt çağrıları üst düzey `usage`'da yoktur, `usage.iterations` içinden advisor modeliyle ayrıca sayılır (model satırında `(advisor)`) |
-| Oturum → hesap | `<config>/history.jsonl`; her yanıt, o oturumda kendisinden önceki son istemi gönderen hesaba yazılır. Oturumun ortasında hesap değiştirip `--resume` yaparsanız kullanım doğru bölünür |
+| Oturum → hesap | `<config>/history.jsonl`; her yanıt, o oturumda kendisinden önceki son istemi gönderen hesaba yazılır. Oturumun ortasında hesap değiştirip `--resume` yaparsanız kullanım doğru bölünür. Aynı config dizininde `/login` ile başka hesaba geçerseniz geçiş anı Claude Code'un `<config>/backups/.claude.json.backup.*` yedeklerinden bulunur; önceki kullanım önceki hesaba yazılır ve o hesap raporda "önceki hesap" olarak görünür (geçmiş: `~/.local/state/claude-usage/logins/`) |
 | Oturum adı | transcript'teki `ai-title` kaydı, yoksa ilk istem |
 | Limit yüzdeleri | `https://api.anthropic.com/api/oauth/usage` (Claude Code'un `/usage` ekranının kullandığı uç nokta). Token süresi dolmuşsa `.claude.json` içindeki önbellek kullanılır ve yaşı belirtilir |
 
