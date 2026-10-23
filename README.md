@@ -53,10 +53,10 @@ yedeği alınır. Başka bir status line tanımlıysa ona dokunulmaz. Kaldırmak
 `claude-usage --uninstall-hooks`.
 
 ```
-Opus 5.5 · bağlam 452K (~$0.09/istek) · oturum $23 · 5s %88 →17:04 · hafta %77 (süre %64) ⚠ ~Cmt 00:03 dolar
+Opus 5.5 (high) · bağlam 452K (~$0.09/istek) · oturum $23 · 5s %88 →17:04 · hafta %77 (süre %64) ⚠ ~Cmt 00:03 dolar
 ```
 
-- **Status line:** model, bağlam boyutu (200K üstünde istek başına en az cache okuma
+- **Status line:** model ve effort düzeyi (fast mode açıksa ⚡fast), bağlam boyutu (200K üstünde istek başına en az cache okuma
   maliyeti), oturumun maliyeti (Claude Code'un kendi tahmini), 5 saatlik ve haftalık limit.
   "süre" haftanın geçen kısmıdır; kullanım bunun önündeyse hafta ortalamasıyla limitin
   ne zaman dolacağı gösterilir. Önbellek soğuduğunda sonraki isteğin yeniden yazma maliyeti

@@ -560,7 +560,13 @@ def statusline_text(j, now):
         if merged:
             rl = merged
             write_json(acct_p, {"at": now, "dir": d, "acct": email, "rate_limits": merged})
-    parts = [m.get("display_name") or mid or "Claude"]
+    name = m.get("display_name") or mid or "Claude"
+    effort = (j.get("effort") or {}).get("level")
+    if effort:
+        name += f" ({effort})"
+    if j.get("fast_mode"):
+        name += " ⚡fast"
+    parts = [name]
 
     if ctx:
         s = f"bağlam {ctx // 1000}K"
