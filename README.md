@@ -100,8 +100,8 @@ Oturumlar (en pahalı 2/10):
 | Limit yüzdeleri | `https://api.anthropic.com/api/oauth/usage` (Claude Code'un `/usage` ekranının kullandığı uç nokta). Token süresi dolmuşsa `.claude.json` içindeki önbellek kullanılır ve yaşı belirtilir |
 
 **Hesap keşfi.** `$CLAUDE_CONFIG_DIR`, `~/.claude` ve `~/.claude-*` dizinleri taranır. Etiket
-hesabın e-postası, plan çarpanı (Max 5x → 5, Max 20x → 20, diğer → 1) credentials'taki
-`rateLimitTier` değeridir. Birden çok hesabınız varsa hepsi ayrı raporlanır.
+hesabın e-postası, plan çarpanı (Max 5x → 5, Max 20x → 20, diğer → 1) `.claude.json`'daki
+`organizationRateLimitTier` değeridir (yoksa credentials'taki `rateLimitTier`). Birden çok hesabınız varsa hepsi ayrı raporlanır.
 
 **Maliyet.** API liste fiyatıyla tahmindir (betiğin başındaki `PRICE` tablosu, model adının en
 uzun eşleşen önekiyle). Cache yazma TTL'e göre fiyatlanır: 5 dakikalık 1.25 × input, 1 saatlik

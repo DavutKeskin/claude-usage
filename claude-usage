@@ -10,7 +10,7 @@ Kullanım:
   claude-usage --json          # ham veri
 
 Yapılandırma gerekmez: $CLAUDE_CONFIG_DIR, ~/.claude ve ~/.claude-* dizinleri otomatik
-bulunur; hesap etiketi e-postadan, plan çarpanı (Max 5x/20x) credentials'tan okunur.
+bulunur; hesap etiketi e-postadan, plan çarpanı (Max 5x/20x) .claude.json'dan okunur.
 İsteğe bağlı geçersiz kılma: ~/.config/claude-usage/config.json  (bkz. README)
 
 Veri kaynakları (hepsi yerel; yalnızca limit yüzdeleri için api.anthropic.com'a gidilir):
@@ -192,8 +192,9 @@ def discover_accounts():
             continue
         labels.add(label)
         if not mult:
-            mult = tier_mult(load_credentials(d).get("rateLimitTier")
-                             or (claude_json(d).get("oauthAccount") or {}).get("organizationRateLimitTier"))
+            # .claude.json plan değişince güncellenir; credentials ancak token yenilenince
+            mult = tier_mult((claude_json(d).get("oauthAccount") or {}).get("organizationRateLimitTier")
+                             or load_credentials(d).get("rateLimitTier"))
         ACCOUNTS.append((d, label, mult))
     if not ACCOUNTS:
         sys.exit("Claude Code yapılandırma dizini bulunamadı (~/.claude, ~/.claude-*, $CLAUDE_CONFIG_DIR).")
@@ -501,17 +502,14 @@ def week_pace(used, reset, now):
 
 
 def merge_limits(old, new):
-    """Hesabın bilinen en taze limitleri. Her oturum yalnızca kendi son yanıtının rate_limits'ini
-    görür; boşta bekleyen bir oturumun eski değeri taze veriyi ezmesin diye aynı pencerede en
-    yüksek yüzde, daha yeni pencere gelirse o alınır."""
+    """Pencere başına new'i alır; yalnızca old daha yeni bir pencereye aitse old kalır. Yüzde aynı
+    pencerede de düşebilir (plan yükseltmesi, Anthropic'in sıfırlaması), en yüksek değer alınmaz."""
     out = dict(old or {})
     for name, w in (new or {}).items():
         o = out.get(name) or {}
         if not isinstance(w, dict) or not w.get("resets_at"):
             continue
-        r, ro = w["resets_at"], o.get("resets_at") or 0
-        if r > ro + 600 or (abs(r - ro) <= 600
-                            and (w.get("used_percentage") or 0) >= (o.get("used_percentage") or 0)):
+        if w["resets_at"] >= (o.get("resets_at") or 0) - 600:
             out[name] = w
     return out
 
@@ -552,14 +550,20 @@ def statusline_text(j, now):
         email, tier = _email_tier(claude_json(d))
         email = email or os.path.basename(d)
         account_history(d, (email, tier))   # hesap değiştiyse değişim anını kaydeder
+        sess_p = state_path("session", sid)
+        # Claude Code her çizimde oturumun son yanıtının rate_limits'ini yeniden verir; boşta bekleyen
+        # oturumun eski değeri hesabın taze verisini ezmesin diye yalnızca değiştiyse yeni sayılır.
+        fresh = bool(rl) and rl != _read_json(sess_p).get("rate_limits")
         st = {"at": now, "dir": d, "acct": email, "model": mid, "ctx": ctx, "cost": cost_usd,
               "rate_limits": rl}
-        write_json(state_path("session", sid), st)
+        write_json(sess_p, st)
         acct_p = state_path("account", account_key(d, email))
-        merged = merge_limits(_read_json(acct_p).get("rate_limits"), rl)
-        if merged:
-            rl = merged
-            write_json(acct_p, {"at": now, "dir": d, "acct": email, "rate_limits": merged})
+        acct_rl = _read_json(acct_p).get("rate_limits")
+        if fresh:
+            rl = merge_limits(acct_rl, rl)
+            write_json(acct_p, {"at": now, "dir": d, "acct": email, "rate_limits": rl})
+        else:
+            rl = merge_limits(rl, acct_rl)
     name = m.get("display_name") or mid or "Claude"
     effort = (j.get("effort") or {}).get("level")
     if effort:
@@ -644,7 +648,7 @@ def hook_stop(j, now):
     seen_p = state_path("alerts", account_key(d, email))
     seen = _read_json(seen_p)
     acct = _read_json(state_path("account", account_key(d, email)))
-    msgs = limit_alerts({"rate_limits": merge_limits(acct.get("rate_limits"), st.get("rate_limits"))},
+    msgs = limit_alerts({"rate_limits": merge_limits(st.get("rate_limits"), acct.get("rate_limits"))},
                         now, seen)
 
     # Bağlam: oturum başına; /compact sonrası eşiğin altına inince sıfırlanır
@@ -1077,7 +1081,7 @@ def report(a):
 
     print("Notlar: maliyetler API liste fiyatıyla tahmindir (1 saatlik cache yazma 2 × input; advisor "
           "alt çağrıları advisor modelinin fiyatıyla dahil); limit payları kalibrasyona dayalıdır "
-          "(plan çarpanı credentials'tan okunur). Hesaplar arası --resume yapılan oturumlarda "
+          "(plan çarpanı .claude.json'dan okunur). Hesaplar arası --resume yapılan oturumlarda "
           "her yanıt, önceki istemi gönderen hesaba yazılır.")
 
 
